@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+
+###############################################################################
+# backup-all
+#
+# Create one encrypted backup per target and move each completed backup to the
+# selected backup destination.
+#
+# Each target is processed independently:
+# - create a temporary local backup directory
+# - write INFO.md
+# - create and verify an encrypted .tar.age archive
+# - write SHA256SUMS.txt
+# - move the completed backup to the destination using a .partial
+#   directory
+#
+# This makes large backups easier to resume and limits local disk usage.
+###############################################################################
+
+set -euo pipefail
+
+age_key_arg=""
+destination=""
+
+usage() {
+  echo "Usage: backup-all --destination=<backup-destination> [--path-to-age-key=<pass-path>] <target_1> <target_2>..." >&2
+}
+
+step() {
+  echo
+  echo "[$1/7] $2"
+}
+
+safe_name() {
+  local parent
+  local base
+
+  parent="$(basename "$(dirname "$1")")"
+  base="$(basename "$1")"
+
+  printf '%s-%s' "$parent" "$base" \
+    | sed 's/[^a-zA-Z0-9._-]/_/g'
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --destination=*)
+      destination="${1#--destination=}"
+      shift
+      ;;
+    --destination)
+      echo "Error: use --destination=<backup-destination>" >&2
+      exit 1
+      ;;
+    --path-to-age-key=*)
+      age_key_arg="$1"
+      shift
+      ;;
+    --path-to-age-key)
+      echo "Error: use --path-to-age-key=<pass-path>" >&2
+      exit 1
+      ;;
+    -*)
+      echo "Error: unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [ "$#" -lt 1 ]; then
+  usage
+  exit 1
+fi
+
+if [ -z "$destination" ]; then
+  echo "Error: missing required --destination=<backup-destination>" >&2
+  usage
+  exit 1
+fi
+
+targets=()
+
+for target in "$@"; do
+  if [ ! -e "$target" ]; then
+    echo "Error: target not found: $target" >&2
+    exit 1
+  fi
+
+  targets+=("$(realpath "$target")")
+done
+
+backup_destination="$(realpath -m "$destination")"
+
+if ! encrypt_script="$(command -v encrypt-this)"; then
+  echo "Error: encrypt-this is not installed or not in PATH." >&2
+  exit 1
+fi
+
+mkdir -p "$backup_destination"
+
+for target in "${targets[@]}"; do
+  run_id="$(date +%y%m%d-%H%M%S)"
+  name="$(safe_name "$target")"
+
+  backup_name="$name-backup-$run_id"
+  local_backup="/tmp/$backup_name"
+  final_backup="$backup_destination/$backup_name"
+  partial_backup="$backup_destination/$backup_name.partial"
+
+  info_file="$local_backup/INFO.md"
+  checksum_file="$local_backup/SHA256SUMS.txt"
+
+  if [ -e "$final_backup" ]; then
+    echo "Error: final backup already exists: $final_backup" >&2
+    exit 1
+  fi
+
+  if [ -e "$partial_backup" ]; then
+    echo "Error: partial backup already exists: $partial_backup" >&2
+    echo "Remove it manually if it comes from an interrupted previous run." >&2
+    exit 1
+  fi
+
+  if [ -e "$local_backup" ]; then
+    echo "Error: local temporary backup already exists: $local_backup" >&2
+    exit 1
+  fi
+
+  step 1 "Prepare local backup for $target"
+  mkdir -p "$local_backup"
+  cd "$local_backup"
+
+  echo "Target: $target"
+  echo "Local:  $local_backup"
+  echo "Final:  $final_backup"
+
+  step 2 "Check available space"
+  df -h "$local_backup"
+
+  step 3 "Check backup size"
+  backup_size="$(du -sh "$target")"
+  printf '%s\n' "$backup_size"
+
+  step 4 "Write INFO.md"
+  {
+    echo "# $backup_name"
+    echo
+    echo "Created: $(date -Is)"
+    echo "Host: $(hostname)"
+    echo "Run ID: $run_id"
+    echo "Target: $target"
+    echo
+    echo "## Source size"
+    echo
+    echo '```text'
+    printf '%s\n' "$backup_size"
+    echo '```'
+    echo
+    echo "## Source tree"
+    echo
+    echo '```text'
+    du -h --max-depth=3 "$target" | sort -h
+    echo '```'
+  } > "$info_file"
+
+  step 5 "Create encrypted archive"
+  if [ -n "$age_key_arg" ]; then
+    bash "$encrypt_script" "$age_key_arg" "$target"
+  else
+    bash "$encrypt_script" "$target"
+  fi
+
+  step 6 "Create and verify checksums"
+  sha256sum ./*.tar.age | tee "$checksum_file"
+  sha256sum -c "$checksum_file"
+
+  {
+    echo
+    echo "## Encrypted archive SHA-256"
+    echo
+    echo '```text'
+    cat "$checksum_file"
+    echo '```'
+  } >> "$info_file"
+
+  echo
+  echo "Local backup content:"
+  ls -lh "$local_backup"
+
+  step 7 "Move backup to destination"
+  mv "$local_backup" "$partial_backup"
+  mv "$partial_backup" "$final_backup"
+
+  echo
+  echo "Final backup content:"
+  ls -lh "$final_backup"
+
+  echo
+  echo "Done:"
+  echo "$final_backup"
+
+  echo
+  echo "----------------------------------------"
+done

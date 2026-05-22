@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+
+###############################################################################
+# backup-user-apps
+#
+# Create a local recovery snapshot for installed apps and user-side app config.
+#
+# The backup includes package/app manifests, desktop configuration, selected
+# ~/.local/share configuration directories, ~/.ssh, and ~/.gnupg.
+#
+# It intentionally avoids broad cache/state/app-data folders when possible.
+###############################################################################
+
+set -euo pipefail
+umask 077
+
+run_id="$(date +%y%m%d-%H%M%S)"
+output_root="${1:-$HOME/Desktop/Backups/Spectre}"
+backup_dir="$output_root/user-apps-$run_id"
+
+mkdir -p "$backup_dir/manifests"
+mkdir -p "$backup_dir/user-configs"
+chmod 700 "$backup_dir"
+
+write_if_available() {
+  local name="$1"
+  shift
+
+  if command -v "$1" >/dev/null 2>&1; then
+    "$@" > "$backup_dir/manifests/$name" 2>&1 || true
+  fi
+}
+
+copy_if_exists() {
+  local src="$1"
+  local dst="$backup_dir/user-configs/$(basename "$src")"
+
+  if [ -e "$src" ]; then
+    echo "Copying: $src"
+    cp -a "$src" "$dst"
+  fi
+}
+
+copy_flatpak_configs() {
+  local app
+  local app_id
+  local dst_root="$backup_dir/user-configs/flatpak-app-configs"
+
+  if [ ! -d "$HOME/.var/app" ]; then
+    return 0
+  fi
+
+  mkdir -p "$dst_root"
+
+  for app in "$HOME/.var/app"/*; do
+    [ -d "$app/config" ] || continue
+
+    app_id="$(basename "$app")"
+    echo "Copying Flatpak config: $app_id"
+    mkdir -p "$dst_root/$app_id"
+    cp -a "$app/config" "$dst_root/$app_id/"
+  done
+}
+
+echo "Creating user app backup:"
+echo "$backup_dir"
+
+cat > "$backup_dir/INFO.md" <<EOF
+# User Apps Backup $run_id
+
+Created: $(date -Is)
+Host: $(hostname)
+
+This backup contains:
+- installed application/package lists
+- user-side app configurations
+- selected desktop/app recovery files
+
+It avoids broad cache/state folders when possible.
+It does not contain full system configuration from /etc.
+EOF
+
+echo
+echo "[1/3] Saving installed app/package manifests"
+
+write_if_available "apt-manual.txt" apt-mark showmanual
+write_if_available "dpkg-selections.txt" dpkg --get-selections
+write_if_available "snap-list.txt" snap list
+write_if_available "flatpak-apps.txt" flatpak list --app
+write_if_available "pipx-list.txt" pipx list
+write_if_available "npm-global.txt" npm list -g --depth=0
+write_if_available "cargo-installed.txt" cargo install --list
+write_if_available "go-env.txt" go env
+write_if_available "python-version.txt" python3 --version
+write_if_available "node-version.txt" node --version
+write_if_available "git-version.txt" git --version
+
+if command -v code >/dev/null 2>&1; then
+  code --list-extensions > "$backup_dir/manifests/vscode-extensions.txt" 2>/dev/null || true
+fi
+
+if command -v gnome-extensions >/dev/null 2>&1; then
+  gnome-extensions list > "$backup_dir/manifests/gnome-extensions.txt" 2>/dev/null || true
+fi
+
+if command -v gsettings >/dev/null 2>&1; then
+  gsettings list-recursively > "$backup_dir/manifests/gsettings.txt" 2>/dev/null || true
+fi
+
+echo
+echo "[2/3] Copying user app configs"
+
+copy_if_exists "$HOME/.config"
+copy_if_exists "$HOME/.local/bin"
+
+copy_if_exists "$HOME/.local/share/applications"
+copy_if_exists "$HOME/.local/share/backgrounds"
+copy_if_exists "$HOME/.local/share/fonts"
+copy_if_exists "$HOME/.local/share/icons"
+copy_if_exists "$HOME/.local/share/icc"
+copy_if_exists "$HOME/.local/share/mime"
+copy_if_exists "$HOME/.local/share/sounds"
+copy_if_exists "$HOME/.local/share/thumbnailers"
+
+copy_if_exists "$HOME/.local/share/glib-2.0"
+copy_if_exists "$HOME/.local/share/gvfs-metadata"
+copy_if_exists "$HOME/.local/share/ibus-table"
+copy_if_exists "$HOME/.local/share/locale"
+
+for path in "$HOME/.local/share"/gnome-*; do
+  [ -e "$path" ] || continue
+  copy_if_exists "$path"
+done
+
+# Sensitive but important for machine recovery: SSH and GPG keys/config.
+# The clear backup directory must be encrypted and removed immediately.
+copy_if_exists "$HOME/.ssh"
+copy_if_exists "$HOME/.gnupg"
+# Sensitive: stored desktop secrets/passwords.
+# Enable only if you understand the risk and use strong encryption.
+# copy_if_exists "$HOME/.local/share/keyrings"
+
+copy_flatpak_configs
+
+echo
+echo "[3/3] Writing summary"
+
+{
+  echo "# Backup content"
+  echo
+  echo "## Size"
+  echo
+  echo '```text'
+  du -sh "$backup_dir"
+  echo '```'
+  echo
+  echo "## Tree"
+  echo
+  echo '```text'
+  find "$backup_dir" -maxdepth 3 -print | sort
+  echo '```'
+} >> "$backup_dir/INFO.md"
+
+echo
+echo "Done:"
+echo "$backup_dir"
