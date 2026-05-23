@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: clone-github <github-username-or-org>" >&2
+}
+
+if [ "$#" -ne 1 ]; then
+  usage
+  exit 1
+fi
+
+owner="$1"
+backup_dir="backup-$(date +%y%m%d)"
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "Error: GitHub CLI is not installed: gh" >&2
+  echo "Install it first, then run: gh auth login" >&2
+  exit 1
+fi
+
+if [ -e "$backup_dir" ]; then
+  echo "Error: backup directory already exists: $backup_dir" >&2
+  exit 1
+fi
+
+mkdir -p "$backup_dir"
+
+gh repo list "$owner" --limit 4000 --json nameWithOwner --jq '.[].nameWithOwner' |
+while IFS= read -r repo; do
+  target="$backup_dir/$repo"
+  mkdir -p "$(dirname "$target")"
+
+  echo "Cloning: $repo"
+  gh repo clone "$repo" "$target"
+done
+
+echo
+echo "Done:"
+echo "$backup_dir"

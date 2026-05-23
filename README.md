@@ -53,7 +53,7 @@ Example desktop layout:
 ~/Desktop
 ├── Works: Active work and projects.
 ├── Chores: Active personal tasks.
-└── Backups: Local staging area for external device and machine backups.
+└── Backups: Local backups directory.
 ```
 
 ## What to backup
@@ -67,12 +67,21 @@ Typical backup targets:
 ~/Desktop/Backups
 ```
 
+## External Data Sources
+
+Some data may live outside the main user filesystem: phones, e-readers, repository hosting platforms, external drives, or cloud services.
+
+These sources should first be copied into a local backups directory, for example `~/Desktop/Backups`, then included in the main encrypted backup workflow.
+
+See `EXTERNAL_DATA_SOURCES.md` for source-specific workflows.
+
 ## Tools
 
 * `encrypt-this`: create and verify one encrypted `.tar.age` archive from a file or directory.
 * `backup-all`: create one encrypted backup per target and move them to a chosen backup destination.
 * `backup-user-apps`: create a local snapshot of installed apps and user-side app state.
 * `backup-machine-state`: create a local snapshot of system-level configuration such as `/etc`.
+* `clone-github`: clone all repositories from a GitHub user or organization into a dated local backup directory.
 
 ## Workflow
 
@@ -108,4 +117,11 @@ Optional sound notification, used to alert when action is required to unlock the
 
 ```bash
 sudo apt install pulseaudio-utils
+```
+
+Optional GitHub external source workflow:
+
+```bash
+sudo apt install gh
+gh auth login
 ```
