@@ -8,8 +8,7 @@ It is designed for manual backup sessions where clarity and portability matter m
 Each step stays visible: organize files, prepare recovery snapshots, encrypt archives, verify them
 locally, and move them to backup storage.
 
-This is not a replacement for automated incremental backup systems such as Borg, Restic, Kopia, or
-rsync-based snapshot workflows.
+This is not a replacement for automated incremental backup systems or rsync-based snapshot workflows.
 
 Tested target: GNU/Linux / Ubuntu.
 
@@ -27,11 +26,16 @@ Each encrypted backup includes:
 - an `INFO.md` file describing the source
 - a `SHA256SUMS.txt` file for integrity verification
 
-Large backups are processed one target at a time. This limits local disk usage and makes interrupted backups easier to resume.
+Large backups are processed one target at a time. This limits local disk usage and makes interrupted
+backups easier to resume.
 
-## Local Documents Organization
+## Local Filesystem Organization
 
-Example personal document layout:
+The workflow assumes that important files live in a small number of known locations.
+
+### Primary backup locations
+
+These locations contain files that should be backed up:
 
 ```text
 ~/Documents
@@ -45,20 +49,40 @@ Example personal document layout:
 ├── Cooking: Recipes.
 ├── Media: Audio, graphics, wallpapers, and software.
 └── Archives: Old exports and inactive material.
-```
 
-Example desktop layout:
-
-```text
 ~/Desktop
-├── Works: Active work and projects.
+├── Works: Active GUI work and projects.
 ├── Chores: Active personal tasks.
 └── Backups: Local backups directory.
 ```
 
-## What to backup
+`~/Desktop/Backups` is used for local copies of external data sources before they are included in the encrypted backup workflow.
 
-Typical backup targets:
+`~/Documents` should stay as light as possible so it remains easy to back up.
+
+Important lightweight personal media can live in `~/Documents/Media` or `~/Documents/Memories`.
+
+Large photo or video archives should live in dedicated archive storage, not on the machine SSD.
+See [`photography-archiving-workflow`](https://github.com/clementvidon/photography-archiving-workflow) for a dedicated photo archive workflow.
+
+### Locations outside the default backup scope
+
+These locations usually do not need default backup.
+
+They are usually remote-backed, reconstructible, or replaceable.
+
+```text
+~/code
+├── personal: Personal code projects, usually Git-backed.
+└── external: Third-party repositories and source-installed tools.
+```
+
+Default directories such as `~/Downloads`, `~/Music`, and `~/Videos` can be used for temporary or
+large replaceable files that do not need long-term backup, such as downloads, music, or films.
+
+## Backup Scope
+
+The default encrypted backup scope includes:
 
 ```text
 ~/Documents
@@ -67,11 +91,18 @@ Typical backup targets:
 ~/Desktop/Backups
 ```
 
+This includes local copies of external data sources placed in `~/Desktop/Backups`.
+
+Machine recovery data is generated temporarily during the backup workflow and added to the encrypted
+backup at runtime.
+
 ## External Data Sources
 
-Some data may live outside the main user filesystem: phones, e-readers, repository hosting platforms, external drives, or cloud services.
+Some data may live outside the main user filesystem: phones, e-readers, repository hosting
+platforms, external drives, or cloud services.
 
-These sources should first be copied into a local backups directory, for example `~/Desktop/Backups`, then included in the main encrypted backup workflow.
+These sources should first be copied into a local backups directory, for example
+`~/Desktop/Backups`, then included in the main encrypted backup workflow.
 
 See `EXTERNAL_DATA_SOURCES.md` for source-specific workflows.
 
@@ -87,8 +118,8 @@ See `EXTERNAL_DATA_SOURCES.md` for source-specific workflows.
 
 Follow `WORKFLOW.md` when creating a backup.
 
-Machine recovery snapshots contain sensitive data and are created in clear text temporarily.
-The workflow encrypts them immediately and removes the clear temporary directory.
+Machine recovery snapshots contain sensitive data. They are created temporarily in clear text under
+`/tmp`, included in the encrypted backup, then removed.
 
 ## Install
 
