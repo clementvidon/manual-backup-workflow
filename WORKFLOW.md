@@ -19,7 +19,7 @@ mkdir -p "$LOCAL_BACKUPS_DIR"
 Copy files from external devices, services, or storage locations into your chosen local backups
 directory if needed.
 
-See `EXTERNAL_DATA_SOURCES.md` for source-specific workflows.
+See `EXTERNAL-DATA-SOURCES.md` for source-specific workflows.
 
 ## 2. Prepare machine recovery data
 

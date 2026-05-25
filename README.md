@@ -104,7 +104,7 @@ platforms, external drives, or cloud services.
 These sources should first be copied into a local backups directory, for example
 `~/Desktop/Backups`, then included in the main encrypted backup workflow.
 
-See `EXTERNAL_DATA_SOURCES.md` for source-specific workflows.
+See `EXTERNAL-DATA-SOURCES.md` for source-specific workflows.
 
 ## Tools
 
