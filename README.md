@@ -1,12 +1,12 @@
 # Manual Backup Workflow
 
-Manual Backup Workflow is a small GNU/Linux backup workflow for creating explicit, encrypted,
-verifiable archives that can be understood, inspected, and moved anywhere.
+Manual Backup Workflow creates encrypted, verifiable archives for manual backup sessions.
 
-It is designed for manual backup sessions where clarity and portability matter more than automation.
+It favors clarity and portability over automation: organize your filesystem, prepare machine recovery
+snapshots, encrypt archives, verify them, and move them to backup storage.
 
-Each step stays visible: organize files, prepare recovery snapshots, encrypt archives, verify them
-locally, and move them to backup storage.
+It is intended for workspace and laptop backups, not for managing large long-term media archives.
+For photo/video archive organization, see [`photography-archiving-workflow`](https://github.com/clementvidon/photography-archiving-workflow).
 
 This is not a replacement for automated incremental backup systems or rsync-based snapshot workflows.
 
@@ -18,7 +18,7 @@ The system is based on three ideas:
 
 1. Keep important files in known locations.
 2. Create encrypted, verified archives manually.
-3. Keep enough structure to know what was backed up and how to restore it.
+3. Make each backup self-describing enough to verify and restore later.
 
 Each encrypted backup includes:
 
@@ -26,16 +26,13 @@ Each encrypted backup includes:
 - an `INFO.md` file describing the source
 - a `SHA256SUMS.txt` file for integrity verification
 
-Large backups are processed one target at a time. This limits local disk usage and makes interrupted
-backups easier to resume.
-
 ## Local Filesystem Organization
 
 The workflow assumes that important files live in a small number of known locations.
 
 ### Primary backup locations
 
-These locations contain files that should be backed up:
+These locations should be backed up:
 
 ```text
 ~/Documents
@@ -53,23 +50,20 @@ These locations contain files that should be backed up:
 ~/Desktop
 ├── Works: Active GUI work and projects.
 ├── Chores: Active personal tasks.
-└── Backups: Local backups directory.
+└── Backups: Local copies of external data sources.
 ```
-
-`~/Desktop/Backups` is used for local copies of external data sources before they are included in the encrypted backup workflow.
 
 `~/Documents` should stay as light as possible so it remains easy to back up.
 
 Important lightweight personal media can live in `~/Documents/Media` or `~/Documents/Memories`.
 
 Large photo or video archives should live in dedicated archive storage, not on the machine SSD.
-See [`photography-archiving-workflow`](https://github.com/clementvidon/photography-archiving-workflow) for a dedicated photo archive workflow.
 
 ### Locations outside the default backup scope
 
-These locations usually do not need default backup.
+These locations are not backed up by default.
 
-They are usually remote-backed, reconstructible, or replaceable.
+They are usually reproducible, remote-backed, temporary, or replaceable.
 
 ```text
 ~/code
@@ -91,25 +85,29 @@ The default encrypted backup scope includes:
 ~/Desktop/Backups
 ```
 
-This includes local copies of external data sources placed in `~/Desktop/Backups`.
+`~/Documents` is included entirely.
 
-Machine recovery data is generated temporarily during the backup workflow and added to the encrypted
-backup at runtime.
+Only selected Desktop directories are included. Other Desktop files are outside the default backup
+scope unless moved into `Works`, `Chores`, or `Backups`.
+
+External data sources are included after being copied into `~/Desktop/Backups`.
+
+Machine recovery data is generated during the workflow and added to the encrypted backup.
 
 ## External Data Sources
 
 Some data may live outside the main user filesystem: phones, e-readers, repository hosting
 platforms, external drives, or cloud services.
 
-These sources should first be copied into a local backups directory, for example
-`~/Desktop/Backups`, then included in the main encrypted backup workflow.
+In this workflow, these sources are first copied into `~/Desktop/Backups`, then included in the main
+encrypted backup scope.
 
 See `EXTERNAL-DATA-SOURCES.md` for source-specific workflows.
 
 ## Tools
 
 * `encrypt-this`: create and verify one encrypted `.tar.age` archive from a file or directory.
-* `backup-all`: create one encrypted backup per target and move them to a chosen backup destination.
+* `backup-all`: create one encrypted backup per target and move each completed backup to a chosen destination.
 * `backup-user-apps`: create a local snapshot of installed apps and user-side app state.
 * `backup-machine-state`: create a local snapshot of system-level configuration such as `/etc`.
 * `clone-github`: clone all repositories from a GitHub user or organization into a dated local backup directory.
@@ -123,14 +121,7 @@ Machine recovery snapshots contain sensitive data. They are created temporarily 
 
 ## Install
 
-```bash
-git clone https://github.com/clementvidon/manual-backup-workflow
-cd manual-backup-workflow
-bash install.sh
-hash -r
-```
-
-## Dependencies
+### Install dependencies
 
 For password-based encryption:
 
@@ -150,9 +141,18 @@ Optional sound notification, used to alert when action is required to unlock the
 sudo apt install pulseaudio-utils
 ```
 
-Optional GitHub external source workflow:
+Optional GitHub external data source workflow:
 
 ```bash
 sudo apt install gh
 gh auth login
+```
+
+### Install the workflow tools
+
+```bash
+git clone https://github.com/clementvidon/manual-backup-workflow
+cd manual-backup-workflow
+bash install.sh
+hash -r
 ```
