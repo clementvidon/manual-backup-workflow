@@ -16,8 +16,7 @@ mkdir -p "$LOCAL_BACKUPS_DIR"
 
 ## 1. Prepare external data sources
 
-Copy files from external devices, services, or storage locations into your chosen local backups
-directory if needed.
+Copy files from external devices, services, or storage locations into `$LOCAL_BACKUPS_DIR` if needed.
 
 See `EXTERNAL-DATA-SOURCES.md` for source-specific workflows.
 
@@ -34,9 +33,8 @@ backup-user-apps "$MACHINE_BACKUP_DIR"
 backup-machine-state "$MACHINE_BACKUP_DIR"
 ```
 
-The clear machine recovery directory is created temporarily in `/tmp`, included in the encrypted
-backup, then removed after `backup-all` completes. The `trap` also removes it if the shell exits
-before cleanup.
+The clear machine recovery directory is created temporarily in `/tmp`, added to the encrypted backup
+targets, then removed after `backup-all` finishes.
 
 ## 3. Create encrypted backups
 
@@ -88,9 +86,11 @@ mkdir restored
 age -d backup.tar.age | tar -xf - -C restored
 ```
 
-
 For `pass` / YubiKey mode:
 
 ```bash
-age -d -i <(pass show "$AGE_KEY_PASS_PATH") backup.tar.age | tar -tf -
+AGE_KEY_PASS_PATH="backup/age-key"
+
+mkdir restored
+age -d -i <(pass show "$AGE_KEY_PASS_PATH") backup.tar.age | tar -xf - -C restored
 ```

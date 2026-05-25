@@ -1,8 +1,10 @@
 # External Data Sources Workflow
 
-These workflows copy files from external devices, services, or storage locations into a local backups directory.
+These workflows copy files from external devices, services, or storage locations into a local backups directory before the main encrypted backup workflow.
 
 ## 0. Configure paths
+
+Run the commands from the same shell session.
 
 ```bash
 LOCAL_BACKUPS_DIR="$HOME/Desktop/Backups"
