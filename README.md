@@ -10,7 +10,7 @@ For photo/video archive organization, see [`photography-archiving-workflow`](htt
 
 This is not a replacement for automated incremental backup systems or rsync-based snapshot workflows.
 
-Tested target: GNU/Linux / Ubuntu.
+Tested target: GNU/Linux / Ubuntu. And soon, macOS with Homebrew.
 
 ## Method
 
