@@ -3,7 +3,7 @@
 Manual Backup Workflow creates encrypted, verifiable archives for manual backup sessions.
 
 It favors clarity and portability over automation: organize your filesystem, prepare machine recovery
-snapshots, encrypt archives, verify them, and move them to backup storage.
+snapshots, create and verify encrypted archives, and prepare them for transfer to backup storage.
 
 It is intended for workspace and laptop backups, not for managing large long-term media archives.
 For photo/video archive organization, see [`photography-archiving-workflow`](https://github.com/clementvidon/photography-archiving-workflow).
@@ -14,17 +14,28 @@ Tested on GNU/Linux / Ubuntu for now. Only a few adjustments should be needed to
 
 ## Method
 
-The system is based on three ideas:
+The system is based on four ideas:
 
 1. Keep important files in known locations.
-2. Create encrypted, verified archives manually.
-3. Make each backup self-describing enough to verify and restore later.
+2. Create encrypted, verified backups in a local staging directory.
+3. Transfer completed backups manually to remote backup storage.
+4. Make each backup self-describing enough to verify and restore later.
 
 Each encrypted backup includes:
 
 - a `.tar.age` encrypted archive
 - an `INFO.md` file describing the source
 - a `SHA256SUMS.txt` file for integrity verification
+
+## Backup flow
+
+```text
+source
+  → encrypted and verified backup
+  → local staging directory
+  → manual upload to remote storage
+  → local removal after confirming the remote transfer
+```
 
 ## Local Filesystem Organization
 
@@ -102,19 +113,19 @@ platforms, external drives, or cloud services.
 In this workflow, these sources are first copied into `~/Desktop/Backups`, then included in the main
 encrypted backup scope.
 
-See `EXTERNAL-DATA-SOURCES.md` for source-specific workflows.
+See [`EXTERNAL-DATA-SOURCES.md`](./EXTERNAL-DATA-SOURCES.md) for source-specific workflows.
 
 ## Tools
 
 * `encrypt-this`: create and verify one encrypted `.tar.age` archive from a file or directory.
-* `backup`: create an encrypted backup and move it to a destination.
+* `backup`: create and verify one encrypted backup in a local output directory.
 * `backup-user-apps`: create a local snapshot of installed apps and user-side app state.
 * `backup-machine-state`: create a local snapshot of system-level configuration such as `/etc`.
 * `clone-github`: clone all repositories from a GitHub user or organization into a dated local backup directory.
 
 ## Workflow
 
-Follow `WORKFLOW.md` when creating a backup.
+Follow [`WORKFLOW.md`](./WORKFLOW.md) when creating a backup.
 
 Machine recovery snapshots contain sensitive data. They are created temporarily in clear text under
 `/tmp`, encrypted as a dedicated backup, and then removed.

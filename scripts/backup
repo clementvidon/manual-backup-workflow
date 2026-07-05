@@ -3,32 +3,34 @@
 ###############################################################################
 # backup
 #
-# Create one encrypted backup from one target and move it to the
-# selected backup destination.
+# Create one encrypted, verified backup from one target in a local output
+# directory.
 #
 # The target is processed as follows:
-# - create a temporary local backup directory
+# - check that enough local space is available
+# - create a local .partial backup directory
 # - write INFO.md
 # - create and verify an encrypted .tar.age archive
-# - write SHA256SUMS.txt
-# - move the completed backup to the destination using a .partial
-#   directory
+# - write and verify SHA256SUMS.txt
+# - rename the completed directory to its final name
 #
-# Processing one target at a time limits local disk usage and makes failed backups easier to retry.
+# The completed backup remains local and can then be uploaded manually to
+# remote backup storage.
 ###############################################################################
 
 set -euo pipefail
+umask 077
 
 age_key_arg=""
-destination=""
+output_dir=""
 
 usage() {
-  echo "Usage: backup --destination=<backup-destination> [--path-to-age-key=<pass-path>] <target>" >&2
+  echo "Usage: backup --output-dir=<local-output-directory> [--path-to-age-key=<pass-path>] <target>" >&2
 }
 
 step() {
   echo
-  echo "[$1/7] $2"
+  echo "[$1/4] $2"
 }
 
 safe_name() {
@@ -42,14 +44,68 @@ safe_name() {
     | sed 's/[^a-zA-Z0-9._-]/_/g'
 }
 
+format_bytes() {
+  numfmt --to=iec-i --suffix=B "$1"
+}
+
+check_available_space() {
+  local source="$1"
+  local output="$2"
+
+  local source_size_bytes
+  local available_bytes
+  local percentage_margin
+  local minimum_margin
+  local safety_margin
+  local required_bytes
+
+  minimum_margin=$((2 * 1024 * 1024 * 1024))
+
+  source_size_bytes="$(
+    du -sb --apparent-size "$source" |
+      cut -f1
+  )"
+
+  available_bytes="$(
+    df --output=avail -B1 "$output" |
+      tail -n 1 |
+      tr -d '[:space:]'
+  )"
+
+  percentage_margin=$((source_size_bytes / 10))
+
+  if [ "$percentage_margin" -gt "$minimum_margin" ]; then
+    safety_margin="$percentage_margin"
+  else
+    safety_margin="$minimum_margin"
+  fi
+
+  required_bytes=$((source_size_bytes + safety_margin))
+
+  if [ "$available_bytes" -lt "$required_bytes" ]; then
+    echo "Error: insufficient free space for backup." >&2
+    echo >&2
+    echo "Source:           $source" >&2
+    echo "Output directory: $output" >&2
+    echo "Source size:      $(format_bytes "$source_size_bytes")" >&2
+    echo "Available space:  $(format_bytes "$available_bytes")" >&2
+    echo "Required space:   $(format_bytes "$required_bytes")" >&2
+    echo >&2
+    echo "Required space includes a 10% safety margin, with a minimum margin of 2 GiB." >&2
+    exit 1
+  fi
+
+  printf '%s' "$source_size_bytes"
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --destination=*)
-      destination="${1#--destination=}"
+    --output-dir=*)
+      output_dir="${1#--output-dir=}"
       shift
       ;;
-    --destination)
-      echo "Error: use --destination=<backup-destination>" >&2
+    --output-dir)
+      echo "Error: use --output-dir=<local-output-directory>" >&2
       exit 1
       ;;
     --path-to-age-key=*)
@@ -76,6 +132,12 @@ if [ "$#" -ne 1 ]; then
   exit 1
 fi
 
+if [ -z "$output_dir" ]; then
+  echo "Error: missing required --output-dir=<local-output-directory>" >&2
+  usage
+  exit 1
+fi
+
 target="$1"
 
 if [ ! -e "$target" ]; then
@@ -85,34 +147,39 @@ fi
 
 target="$(realpath "$target")"
 
-if [ -z "$destination" ]; then
-  echo "Error: missing required --destination=<backup-destination>" >&2
-  usage
+mkdir -p "$output_dir"
+backup_output_dir="$(realpath "$output_dir")"
+
+if [ ! -d "$backup_output_dir" ]; then
+  echo "Error: output path is not a directory: $backup_output_dir" >&2
   exit 1
 fi
 
-backup_destination="$(realpath -m "$destination")"
+if [ ! -w "$backup_output_dir" ]; then
+  echo "Error: output directory is not writable: $backup_output_dir" >&2
+  exit 1
+fi
 
 if ! encrypt_script="$(command -v encrypt-this)"; then
   echo "Error: encrypt-this is not installed or not in PATH." >&2
   exit 1
 fi
 
-mkdir -p "$backup_destination"
+source_size_bytes="$(check_available_space "$target" "$backup_output_dir")"
+backup_size="$(format_bytes "$source_size_bytes")"
 
 run_id="$(date +%y%m%d-%H%M%S)"
 name="$(safe_name "$target")"
 
 backup_name="$name-backup-$run_id"
-local_backup="/tmp/$backup_name"
-final_backup="$backup_destination/$backup_name"
-partial_backup="$backup_destination/$backup_name.partial"
+final_backup="$backup_output_dir/$backup_name"
+partial_backup="$backup_output_dir/$backup_name.partial"
 
-info_file="$local_backup/INFO.md"
-checksum_file="$local_backup/SHA256SUMS.txt"
+info_file="$partial_backup/INFO.md"
+checksum_file="$partial_backup/SHA256SUMS.txt"
 
 if [ -e "$final_backup" ]; then
-  echo "Error: final backup already exists: $final_backup" >&2
+  echo "Error: completed backup already exists: $final_backup" >&2
   exit 1
 fi
 
@@ -122,27 +189,17 @@ if [ -e "$partial_backup" ]; then
   exit 1
 fi
 
-if [ -e "$local_backup" ]; then
-  echo "Error: local temporary backup already exists: $local_backup" >&2
-  exit 1
-fi
-
 step 1 "Prepare local backup for $target"
-mkdir -p "$local_backup"
-cd "$local_backup"
 
-echo "Target: $target"
-echo "Local:  $local_backup"
-echo "Final:  $final_backup"
+mkdir -p "$partial_backup"
+cd "$partial_backup"
 
-step 2 "Check available space"
-df -h "$local_backup"
+echo "Target:  $target"
+echo "Working: $partial_backup"
+echo "Final:   $final_backup"
 
-step 3 "Check backup size"
-backup_size="$(du -sh "$target")"
-printf '%s\n' "$backup_size"
+step 2 "Write INFO.md"
 
-step 4 "Write INFO.md"
 {
   echo "# $backup_name"
   echo
@@ -154,7 +211,7 @@ step 4 "Write INFO.md"
   echo "## Source size"
   echo
   echo '```text'
-  printf '%s\n' "$backup_size"
+  echo "$backup_size"
   echo '```'
   echo
   echo "## Source tree"
@@ -164,14 +221,16 @@ step 4 "Write INFO.md"
   echo '```'
 } > "$info_file"
 
-step 5 "Create encrypted archive"
+step 3 "Create and verify encrypted archive"
+
 if [ -n "$age_key_arg" ]; then
   bash "$encrypt_script" "$age_key_arg" "$target"
 else
   bash "$encrypt_script" "$target"
 fi
 
-step 6 "Create and verify checksums"
+step 4 "Create checksums and finalize backup"
+
 sha256sum ./*.tar.age | tee "$checksum_file"
 sha256sum -c "$checksum_file"
 
@@ -184,21 +243,13 @@ sha256sum -c "$checksum_file"
   echo '```'
 } >> "$info_file"
 
-echo
-echo "Local backup content:"
-ls -lh "$local_backup"
-
-step 7 "Move backup to destination"
-mv "$local_backup" "$partial_backup"
+cd "$backup_output_dir"
 mv "$partial_backup" "$final_backup"
 
 echo
-echo "Final backup content:"
+echo "Completed backup:"
 ls -lh "$final_backup"
 
 echo
-echo "Done:"
+echo "Ready for manual upload:"
 echo "$final_backup"
-
-echo
-echo "----------------------------------------"

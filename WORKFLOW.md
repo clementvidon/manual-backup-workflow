@@ -9,9 +9,10 @@ Run the workflow commands **in the same shell session**.
 ```bash
 AGE_KEY_PASS_PATH="backup/age-key"
 EXTERNAL_SOURCES_BACKUPS_DIR="$HOME/Desktop/Backups"
-BACKUP_DESTINATION="$HOME/pCloudDrive/Backup"
+BACKUP_OUTPUT_DIR="$HOME/Desktop/Ready-to-upload"
 
 mkdir -p "$EXTERNAL_SOURCES_BACKUPS_DIR"
+mkdir -p "$BACKUP_OUTPUT_DIR"
 ```
 
 ## 1. Prepare external data sources
@@ -33,76 +34,80 @@ backup-user-apps "$MACHINE_BACKUP_DIR"
 backup-machine-state "$MACHINE_BACKUP_DIR"
 ```
 
-The clear machine recovery directory is created temporarily under `/tmp`. It must be encrypted with
-`backup` and removed only after the resulting encrypted backup has been safely transferred.
+The clear machine recovery directory is created temporarily under `/tmp`. Remove it after `backup`
+has successfully created and verified the corresponding encrypted backup in `$BACKUP_OUTPUT_DIR`.
 
 ## 3. Encrypt and backup the machine recovery data
 
 ```bash
-backup \
-  --destination="$BACKUP_DESTINATION" \
+if backup \
+  --output-dir="$BACKUP_OUTPUT_DIR" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
   "$MACHINE_BACKUP_DIR"
+then
+  rm -rf "$MACHINE_WORK_DIR"
+  trap - EXIT
+fi
 ```
 
 ## 4. Encrypt and backup the personal files
 
-`backup` creates the encrypted archive under `/tmp`. Before starting, make sure the filesystem
-containing `/tmp` has at least as much free space as the source, plus a safety margin.
+`backup` checks the available space in `$BACKUP_OUTPUT_DIR` before starting. It requires enough space
+for the source plus a 10% safety margin, with a minimum margin of 2 GiB.
 
-Run each backup separately and make sure its cloud transfer has completed before starting the next one.
+Run each backup separately. To limit local disk usage, upload and remove each completed backup before
+creating the next one.
 
 ```bash
 backup \
-  --destination="$BACKUP_DESTINATION" \
+  --output-dir="$BACKUP_OUTPUT_DIR" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
   "$HOME/Documents"
 ```
 
 ```bash
 backup \
-  --destination="$BACKUP_DESTINATION" \
+  --output-dir="$BACKUP_OUTPUT_DIR" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
   "$HOME/Desktop/Works"
 ```
 
 ```bash
 backup \
-  --destination="$BACKUP_DESTINATION" \
+  --output-dir="$BACKUP_OUTPUT_DIR" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
   "$HOME/Desktop/Chores"
 ```
 
 ```bash
 backup \
-  --destination="$BACKUP_DESTINATION" \
+  --output-dir="$BACKUP_OUTPUT_DIR" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
   "$EXTERNAL_SOURCES_BACKUPS_DIR"
 ```
 
 Remove `--path-to-age-key="$AGE_KEY_PASS_PATH"` to use password-based encryption.
 
-## 5. Cleanup the temporary files
+## 5. Upload the completed backups
 
-Make sure that the cloud transfers are complete, then run:
+Completed encrypted backups are stored under `$BACKUP_OUTPUT_DIR`.
 
-```bash
-rm -rf "$MACHINE_WORK_DIR"
-trap - EXIT
-```
+Upload each completed backup directory manually to your remote backup storage.
 
-## 6. After backup
+Do not remove the local copy until the upload has completed successfully.
 
-Wait until your backup destination has fully received the encrypted backup directories.
-
-Optional later audit:
+Optional local verification before or after upload:
 
 ```bash
-cd "/path/to/backup-destination/<backup-dir>"
+cd "$BACKUP_OUTPUT_DIR/<backup-directory>"
 sha256sum -c SHA256SUMS.txt
 ```
 
-This audit can take a long time for large backups.
+After confirming that the remote copy is complete, remove the local backup:
+
+```bash
+rm -rf "$BACKUP_OUTPUT_DIR/<backup-directory>"
+```
 
 ## Restore
 
