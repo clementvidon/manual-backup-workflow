@@ -24,11 +24,10 @@ See [`EXTERNAL-DATA-SOURCES.md`](./EXTERNAL-DATA-SOURCES.md) for source-specific
 ## 2. Prepare machine recovery data
 
 ```bash
-MACHINE_RUN_ID="$(date +%y%m%d-%H%M%S)"
 MACHINE_WORK_DIR="$(mktemp -d /tmp/manual-backup-machine.XXXXXX)"
 trap 'rm -rf "$MACHINE_WORK_DIR"' EXIT
 
-MACHINE_BACKUP_DIR="$MACHINE_WORK_DIR/Machine-$MACHINE_RUN_ID"
+MACHINE_BACKUP_DIR="$MACHINE_WORK_DIR/Machine"
 
 backup-user-apps "$MACHINE_BACKUP_DIR"
 backup-machine-state "$MACHINE_BACKUP_DIR"

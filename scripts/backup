@@ -34,14 +34,8 @@ step() {
 }
 
 safe_name() {
-  local parent
-  local base
-
-  parent="$(basename "$(dirname "$1")")"
-  base="$(basename "$1")"
-
-  printf '%s-%s' "$parent" "$base" \
-    | sed 's/[^a-zA-Z0-9._-]/_/g'
+  basename "$1" |
+    sed 's/[^a-zA-Z0-9._-]/_/g'
 }
 
 format_bytes() {
