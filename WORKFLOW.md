@@ -18,7 +18,7 @@ mkdir -p "$EXTERNAL_SOURCES_BACKUPS_DIR"
 
 Copy files from external devices, services, or storage locations into `$EXTERNAL_SOURCES_BACKUPS_DIR` if needed.
 
-See `EXTERNAL-DATA-SOURCES.md` for source-specific workflows.
+See [`EXTERNAL-DATA-SOURCES.md`](./EXTERNAL-DATA-SOURCES.md) for source-specific workflows.
 
 ## 2. Prepare machine recovery data
 
