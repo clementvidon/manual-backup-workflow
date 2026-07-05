@@ -10,7 +10,7 @@ For photo/video archive organization, see [`photography-archiving-workflow`](htt
 
 This is not a replacement for automated incremental backup systems or rsync-based snapshot workflows.
 
-Tested target: GNU/Linux / Ubuntu. And soon, macOS with Homebrew.
+Tested on GNU/Linux / Ubuntu for now. Only a few adjustments should be needed to make the workflow compatible with macOS.
 
 ## Method
 
@@ -107,7 +107,7 @@ See `EXTERNAL-DATA-SOURCES.md` for source-specific workflows.
 ## Tools
 
 * `encrypt-this`: create and verify one encrypted `.tar.age` archive from a file or directory.
-* `backup-all`: create one encrypted backup per target and move each completed backup to a chosen destination.
+* `backup`: create an encrypted backup and move it to a destination.
 * `backup-user-apps`: create a local snapshot of installed apps and user-side app state.
 * `backup-machine-state`: create a local snapshot of system-level configuration such as `/etc`.
 * `clone-github`: clone all repositories from a GitHub user or organization into a dated local backup directory.
@@ -117,7 +117,7 @@ See `EXTERNAL-DATA-SOURCES.md` for source-specific workflows.
 Follow `WORKFLOW.md` when creating a backup.
 
 Machine recovery snapshots contain sensitive data. They are created temporarily in clear text under
-`/tmp`, included in the encrypted backup, then removed.
+`/tmp`, encrypted as a dedicated backup, and then removed.
 
 ## Install
 

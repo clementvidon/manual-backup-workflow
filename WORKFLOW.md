@@ -8,15 +8,15 @@ Run the workflow commands **in the same shell session**.
 
 ```bash
 AGE_KEY_PASS_PATH="backup/age-key"
-LOCAL_BACKUPS_DIR="$HOME/Desktop/Backups"
+EXTERNAL_SOURCES_BACKUPS_DIR="$HOME/Desktop/Backups"
 BACKUP_DESTINATION="$HOME/pCloudDrive/Backup"
 
-mkdir -p "$LOCAL_BACKUPS_DIR"
+mkdir -p "$EXTERNAL_SOURCES_BACKUPS_DIR"
 ```
 
 ## 1. Prepare external data sources
 
-Copy files from external devices, services, or storage locations into `$LOCAL_BACKUPS_DIR` if needed.
+Copy files from external devices, services, or storage locations into `$EXTERNAL_SOURCES_BACKUPS_DIR` if needed.
 
 See `EXTERNAL-DATA-SOURCES.md` for source-specific workflows.
 
@@ -33,32 +33,65 @@ backup-user-apps "$MACHINE_BACKUP_DIR"
 backup-machine-state "$MACHINE_BACKUP_DIR"
 ```
 
-The clear machine recovery directory is created temporarily in `/tmp`, added to the encrypted backup
-targets, then removed after `backup-all` finishes.
+The clear machine recovery directory is created temporarily under `/tmp`. It must be encrypted with
+`backup` and removed only after the resulting encrypted backup has been safely transferred.
 
-## 3. Create encrypted backups
+## 3. Encrypt and backup the machine recovery data
 
 ```bash
-BACKUP_TARGETS=(
-  "$HOME/Documents"
-  "$HOME/Desktop/Works"
-  "$HOME/Desktop/Chores"
-  "$LOCAL_BACKUPS_DIR"
-  "$MACHINE_BACKUP_DIR"
-)
-
-backup-all \
+backup \
   --destination="$BACKUP_DESTINATION" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
-  "${BACKUP_TARGETS[@]}"
+  "$MACHINE_BACKUP_DIR"
+```
 
-rm -rf "$MACHINE_WORK_DIR"
-trap - EXIT
+## 4. Encrypt and backup the personal files
+
+`backup` creates the encrypted archive under `/tmp`. Before starting, make sure the filesystem
+containing `/tmp` has at least as much free space as the source, plus a safety margin.
+
+Run each backup separately and make sure its cloud transfer has completed before starting the next one.
+
+```bash
+backup \
+  --destination="$BACKUP_DESTINATION" \
+  --path-to-age-key="$AGE_KEY_PASS_PATH" \
+  "$HOME/Documents"
+```
+
+```bash
+backup \
+  --destination="$BACKUP_DESTINATION" \
+  --path-to-age-key="$AGE_KEY_PASS_PATH" \
+  "$HOME/Desktop/Works"
+```
+
+```bash
+backup \
+  --destination="$BACKUP_DESTINATION" \
+  --path-to-age-key="$AGE_KEY_PASS_PATH" \
+  "$HOME/Desktop/Chores"
+```
+
+```bash
+backup \
+  --destination="$BACKUP_DESTINATION" \
+  --path-to-age-key="$AGE_KEY_PASS_PATH" \
+  "$EXTERNAL_SOURCES_BACKUPS_DIR"
 ```
 
 Remove `--path-to-age-key="$AGE_KEY_PASS_PATH"` to use password-based encryption.
 
-## 4. After backup
+## 5. Cleanup the temporary files
+
+Make sure that the cloud transfers are complete, then run:
+
+```bash
+rm -rf "$MACHINE_WORK_DIR"
+trap - EXIT
+```
+
+## 6. After backup
 
 Wait until your backup destination has fully received the encrypted backup directories.
 

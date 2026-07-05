@@ -7,8 +7,8 @@ These workflows copy files from external devices, services, or storage locations
 Run the commands from the same shell session.
 
 ```bash
-LOCAL_BACKUPS_DIR="$HOME/Desktop/Backups"
-mkdir -p "$LOCAL_BACKUPS_DIR"
+EXTERNAL_SOURCES_BACKUPS_DIR="$HOME/Desktop/Backups"
+mkdir -p "$EXTERNAL_SOURCES_BACKUPS_DIR"
 ```
 
 ## GitHub
@@ -16,8 +16,8 @@ mkdir -p "$LOCAL_BACKUPS_DIR"
 ```bash
 GITHUB_USERNAME="clementvidon"
 
-mkdir -p "$LOCAL_BACKUPS_DIR/GitHub"
-cd "$LOCAL_BACKUPS_DIR/GitHub"
+mkdir -p "$EXTERNAL_SOURCES_BACKUPS_DIR/GitHub"
+cd "$EXTERNAL_SOURCES_BACKUPS_DIR/GitHub"
 clone-github "$GITHUB_USERNAME"
 ```
 
@@ -26,7 +26,7 @@ clone-github "$GITHUB_USERNAME"
 Create a dated backup directory:
 
 ```bash
-KINDLE_BACKUP_DIR="$LOCAL_BACKUPS_DIR/Kindle/backup-$(date +%y%m%d)"
+KINDLE_BACKUP_DIR="$EXTERNAL_SOURCES_BACKUPS_DIR/Kindle/backup-$(date +%y%m%d)"
 mkdir -p "$KINDLE_BACKUP_DIR"
 ```
 
@@ -44,7 +44,7 @@ My Clippings.txt
 Create a dated backup directory:
 
 ```bash
-PHONE_BACKUP_DIR="$LOCAL_BACKUPS_DIR/Phone/backup-$(date +%y%m%d)"
+PHONE_BACKUP_DIR="$EXTERNAL_SOURCES_BACKUPS_DIR/Phone/backup-$(date +%y%m%d)"
 mkdir -p "$PHONE_BACKUP_DIR"
 ```
 
