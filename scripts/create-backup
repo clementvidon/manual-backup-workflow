@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# backup
+# create-backup
 #
 # Create one encrypted, verified backup from one target in a local output
 # directory.
@@ -25,7 +25,7 @@ age_key_arg=""
 output_dir=""
 
 usage() {
-  echo "Usage: backup --output-dir=<local-output-directory> [--path-to-age-key=<pass-path>] <target>" >&2
+  echo "Usage: create-backup --output-dir=<local-output-directory> [--path-to-age-key=<pass-path>] <target>" >&2
 }
 
 step() {

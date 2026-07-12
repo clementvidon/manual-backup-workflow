@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  sync-backup \
+    --source <directory> \
+    --destination <directory> \
+    --luks-uuid <uuid> \
+    [--mapper <name>] \
+    [--mount-point <directory>] \
+    [--delete]
+
+Example:
+  sync-backup \
+    --source "$HOME/pCloudDrive/Archives/" \
+    --destination "Archives/" \
+    --luks-uuid "a383ce71-a653-4578-9db7-f0a4746a5248" \
+    --mapper "backup" \
+    --mount-point "/mnt/backup" \
+    --delete
+EOF
+}
+
+SOURCE=""
+DESTINATION=""
+LUKS_UUID=""
+MAPPER="backup"
+MOUNT_POINT="/mnt/backup"
+DELETE=false
+OPENED_BY_SCRIPT=false
+MOUNTED_BY_SCRIPT=false
+
+while (($#)); do
+  case "$1" in
+    --source)
+      SOURCE="${2:?Missing value for --source}"
+      shift 2
+      ;;
+    --destination)
+      DESTINATION="${2:?Missing value for --destination}"
+      shift 2
+      ;;
+    --luks-uuid)
+      LUKS_UUID="${2:?Missing value for --luks-uuid}"
+      shift 2
+      ;;
+    --mapper)
+      MAPPER="${2:?Missing value for --mapper}"
+      shift 2
+      ;;
+    --mount-point)
+      MOUNT_POINT="${2:?Missing value for --mount-point}"
+      shift 2
+      ;;
+    --delete)
+      DELETE=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+[[ -n "$SOURCE" && -n "$DESTINATION" && -n "$LUKS_UUID" ]] || {
+  usage >&2
+  exit 2
+}
+
+[[ -d "$SOURCE" ]] || {
+  echo "Source unavailable: $SOURCE" >&2
+  exit 1
+}
+
+[[ "$DESTINATION" != /* ]] || {
+  echo "--destination must be relative to the backup volume." >&2
+  exit 2
+}
+
+SOURCE="${SOURCE%/}/"
+TARGET="${MOUNT_POINT%/}/${DESTINATION#/}"
+TARGET="${TARGET%/}/"
+LUKS_DEVICE="/dev/disk/by-uuid/$LUKS_UUID"
+
+cleanup() {
+  status=$?
+
+  if $MOUNTED_BY_SCRIPT && mountpoint -q "$MOUNT_POINT"; then
+    sudo umount "$MOUNT_POINT" || true
+  fi
+
+  if $OPENED_BY_SCRIPT && sudo cryptsetup status "$MAPPER" >/dev/null 2>&1; then
+    sudo cryptsetup close "$MAPPER" || true
+  fi
+
+  exit "$status"
+}
+
+trap cleanup EXIT INT TERM
+
+if ! sudo cryptsetup status "$MAPPER" >/dev/null 2>&1; then
+  sudo cryptsetup open "$LUKS_DEVICE" "$MAPPER"
+  OPENED_BY_SCRIPT=true
+fi
+
+sudo mkdir -p "$MOUNT_POINT"
+
+if ! mountpoint -q "$MOUNT_POINT"; then
+  sudo mount "/dev/mapper/$MAPPER" "$MOUNT_POINT"
+  MOUNTED_BY_SCRIPT=true
+fi
+
+sudo mkdir -p "$TARGET"
+sudo chown "$USER:$(id -gn)" "$TARGET"
+
+RSYNC_OPTIONS=(
+  --archive
+  --human-readable
+  --partial
+  --info=progress2
+)
+
+if $DELETE; then
+  echo
+  echo "Items that would be deleted from:"
+  echo "  $TARGET"
+  echo
+
+  mapfile -t DELETIONS < <(
+    rsync \
+      --archive \
+      --dry-run \
+      --delete \
+      --itemize-changes \
+      "$SOURCE" \
+      "$TARGET" |
+    sed -n 's/^\*deleting[[:space:]]*//p'
+  )
+
+  if ((${#DELETIONS[@]} == 0)); then
+    echo "  None"
+  else
+    printf '  %s\n' "${DELETIONS[@]}"
+  fi
+
+  echo
+  read -r -p "Continue and mirror the source, including deletions? [y/N] " ANSWER
+
+  case "$ANSWER" in
+    y|Y|yes|YES)
+      RSYNC_OPTIONS+=(--delete)
+      ;;
+    *)
+      echo "Synchronization cancelled."
+      exit 0
+      ;;
+  esac
+fi
+
+rsync "${RSYNC_OPTIONS[@]}" "$SOURCE" "$TARGET"
+
+sync
+echo
+echo "Backup completed successfully."

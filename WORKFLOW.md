@@ -58,28 +58,28 @@ Run each backup separately. To limit local disk usage, upload and remove each co
 creating the next one.
 
 ```bash
-backup \
+create-backup \
   --output-dir="$BACKUP_OUTPUT_DIR" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
   "$HOME/Documents"
 ```
 
 ```bash
-backup \
+create-backup \
   --output-dir="$BACKUP_OUTPUT_DIR" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
   "$HOME/Desktop/Works"
 ```
 
 ```bash
-backup \
+create-backup \
   --output-dir="$BACKUP_OUTPUT_DIR" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
   "$HOME/Desktop/Chores"
 ```
 
 ```bash
-backup \
+create-backup \
   --output-dir="$BACKUP_OUTPUT_DIR" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
   "$EXTERNAL_SOURCES_BACKUPS_DIR"

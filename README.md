@@ -118,7 +118,7 @@ See [`EXTERNAL-DATA-SOURCES.md`](./EXTERNAL-DATA-SOURCES.md) for source-specific
 ## Tools
 
 * `encrypt-this`: create and verify one encrypted `.tar.age` archive from a file or directory.
-* `backup`: create and verify one encrypted backup in a local output directory.
+* `create-backup`: create and verify one encrypted backup in a local output directory.
 * `backup-user-apps`: create a local snapshot of installed apps and user-side app state.
 * `backup-machine-state`: create a local snapshot of system-level configuration such as `/etc`.
 * `clone-github`: clone all repositories from a GitHub user or organization into a dated local backup directory.
