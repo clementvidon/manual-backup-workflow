@@ -4,7 +4,7 @@ set -Eeuo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  sync-backup \
+  sync-luks-backup \
     --source <directory> \
     --destination <directory> \
     --luks-uuid <uuid> \
@@ -13,10 +13,10 @@ Usage:
     [--delete]
 
 Example:
-  sync-backup \
+  sync-luks-backup \
     --source "$HOME/pCloudDrive/Archives/" \
     --destination "Archives/" \
-    --luks-uuid "a383ce71-a653-4578-9db7-f0a4746a5248" \
+    --luks-uuid "52936657-45cb-4718-b305-19698ca1cbf7" \
     --mapper "backup" \
     --mount-point "/mnt/backup" \
     --delete
@@ -29,6 +29,7 @@ LUKS_UUID=""
 MAPPER="backup"
 MOUNT_POINT="/mnt/backup"
 DELETE=false
+
 OPENED_BY_SCRIPT=false
 MOUNTED_BY_SCRIPT=false
 
@@ -75,6 +76,20 @@ done
   exit 2
 }
 
+for command in \
+  cryptsetup \
+  findmnt \
+  lsblk \
+  mountpoint \
+  rsync \
+  sync \
+  umount; do
+  command -v "$command" >/dev/null 2>&1 || {
+    echo "Required command not found: $command" >&2
+    exit 1
+  }
+done
+
 [[ -d "$SOURCE" ]] || {
   echo "Source unavailable: $SOURCE" >&2
   exit 1
@@ -85,88 +100,274 @@ done
   exit 2
 }
 
-SOURCE="${SOURCE%/}/"
-TARGET="${MOUNT_POINT%/}/${DESTINATION#/}"
-TARGET="${TARGET%/}/"
+[[ "$DESTINATION" != "." &&
+   "$DESTINATION" != ".." &&
+   "$DESTINATION" != ../* &&
+   "$DESTINATION" != */../* &&
+   "$DESTINATION" != */.. ]] || {
+  echo "--destination must not contain '..' path components." >&2
+  exit 2
+}
+
 LUKS_DEVICE="/dev/disk/by-uuid/$LUKS_UUID"
 
+[[ -e "$LUKS_DEVICE" ]] || {
+  echo "LUKS device not found: $LUKS_DEVICE" >&2
+  exit 1
+}
+
+LUKS_DEVICE="$(readlink -f "$LUKS_DEVICE")"
+
+[[ "$(lsblk -dnro FSTYPE "$LUKS_DEVICE")" == "crypto_LUKS" ]] || {
+  echo "Device is not a LUKS container: $LUKS_DEVICE" >&2
+  exit 1
+}
+
+SOURCE="${SOURCE%/}/"
+MOUNT_POINT="${MOUNT_POINT%/}"
+TARGET="${MOUNT_POINT}/${DESTINATION#/}"
+TARGET="${TARGET%/}/"
+
 cleanup() {
-  status=$?
+  local status=$?
+
+  trap - EXIT INT TERM
 
   if $MOUNTED_BY_SCRIPT && mountpoint -q "$MOUNT_POINT"; then
+    echo
+    echo "Unmounting $MOUNT_POINT..."
     sudo umount "$MOUNT_POINT" || true
   fi
 
-  if $OPENED_BY_SCRIPT && sudo cryptsetup status "$MAPPER" >/dev/null 2>&1; then
+  if $OPENED_BY_SCRIPT &&
+     sudo cryptsetup status "$MAPPER" >/dev/null 2>&1; then
+    echo "Closing LUKS mapper $MAPPER..."
     sudo cryptsetup close "$MAPPER" || true
   fi
 
   exit "$status"
 }
 
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-if ! sudo cryptsetup status "$MAPPER" >/dev/null 2>&1; then
-  sudo cryptsetup open "$LUKS_DEVICE" "$MAPPER"
-  OPENED_BY_SCRIPT=true
-fi
+normalize_luks_state() {
+  local mapped_device
+  local mapper_name
+  local mount_target
+
+  mapfile -t EXISTING_MAPPERS < <(
+    lsblk -nrpo NAME,TYPE "$LUKS_DEVICE" |
+      awk '$2 == "crypt" { print $1 }'
+  )
+
+  if ((${#EXISTING_MAPPERS[@]} == 0)); then
+    return
+  fi
+
+  echo
+  echo "The LUKS volume is already open. Normalizing its state..."
+
+  for mapped_device in "${EXISTING_MAPPERS[@]}"; do
+    mapper_name="$(basename "$mapped_device")"
+
+    mapfile -t MOUNT_TARGETS < <(
+      findmnt -rn -S "$mapped_device" -o TARGET || true
+    )
+
+    for mount_target in "${MOUNT_TARGETS[@]}"; do
+      [[ -n "$mount_target" ]] || continue
+
+      echo "Unmounting existing mount: $mount_target"
+
+      if ! sudo umount "$mount_target"; then
+        echo "Unable to unmount $mount_target." >&2
+        echo "Close any application using the volume and try again." >&2
+        exit 1
+      fi
+    done
+
+    if sudo cryptsetup status "$mapper_name" >/dev/null 2>&1; then
+      echo "Closing existing mapper: $mapper_name"
+
+      if ! sudo cryptsetup close "$mapper_name"; then
+        echo "Unable to close mapper: $mapper_name" >&2
+        exit 1
+      fi
+    fi
+  done
+}
+
+normalize_luks_state
+
+echo
+echo "Opening LUKS volume as $MAPPER..."
+sudo cryptsetup open "$LUKS_DEVICE" "$MAPPER"
+OPENED_BY_SCRIPT=true
+
+MAPPED_DEVICE="/dev/mapper/$MAPPER"
+
+[[ -b "$MAPPED_DEVICE" ]] || {
+  echo "Mapped device unavailable: $MAPPED_DEVICE" >&2
+  exit 1
+}
 
 sudo mkdir -p "$MOUNT_POINT"
 
-if ! mountpoint -q "$MOUNT_POINT"; then
-  sudo mount "/dev/mapper/$MAPPER" "$MOUNT_POINT"
-  MOUNTED_BY_SCRIPT=true
-fi
+echo "Mounting $MAPPED_DEVICE at $MOUNT_POINT..."
+sudo mount "$MAPPED_DEVICE" "$MOUNT_POINT"
+MOUNTED_BY_SCRIPT=true
 
-sudo mkdir -p "$TARGET"
-sudo chown "$USER:$(id -gn)" "$TARGET"
+MOUNTED_SOURCE="$(findmnt -n -o SOURCE --target "$MOUNT_POINT")"
+MOUNTED_SOURCE="$(readlink -f "$MOUNTED_SOURCE")"
+EXPECTED_SOURCE="$(readlink -f "$MAPPED_DEVICE")"
+
+[[ "$MOUNTED_SOURCE" == "$EXPECTED_SOURCE" ]] || {
+  echo "Unexpected device mounted at $MOUNT_POINT:" >&2
+  echo "  Expected: $EXPECTED_SOURCE" >&2
+  echo "  Found:    $MOUNTED_SOURCE" >&2
+  exit 1
+}
+
+MOUNT_OPTIONS="$(findmnt -n -o OPTIONS --target "$MOUNT_POINT")"
+
+[[ ",$MOUNT_OPTIONS," == *,rw,* ]] || {
+  echo "Backup volume is not mounted read-write." >&2
+  echo "Mount options: $MOUNT_OPTIONS" >&2
+  exit 1
+}
+
+sudo install \
+  -d \
+  -o "$USER" \
+  -g "$(id -gn)" \
+  "$TARGET"
+
+[[ -w "$TARGET" ]] || {
+  echo "Destination is not writable: $TARGET" >&2
+  exit 1
+}
 
 RSYNC_OPTIONS=(
   --archive
   --human-readable
   --partial
+  --no-inc-recursive
   --info=progress2
 )
 
+DRY_RUN_OPTIONS=(
+  --archive
+  --human-readable
+  --dry-run
+  --itemize-changes
+)
+
 if $DELETE; then
-  echo
-  echo "Items that would be deleted from:"
-  echo "  $TARGET"
-  echo
-
-  mapfile -t DELETIONS < <(
-    rsync \
-      --archive \
-      --dry-run \
-      --delete \
-      --itemize-changes \
-      "$SOURCE" \
-      "$TARGET" |
-    sed -n 's/^\*deleting[[:space:]]*//p'
-  )
-
-  if ((${#DELETIONS[@]} == 0)); then
-    echo "  None"
-  else
-    printf '  %s\n' "${DELETIONS[@]}"
-  fi
-
-  echo
-  read -r -p "Continue and mirror the source, including deletions? [y/N] " ANSWER
-
-  case "$ANSWER" in
-    y|Y|yes|YES)
-      RSYNC_OPTIONS+=(--delete)
-      ;;
-    *)
-      echo "Synchronization cancelled."
-      exit 0
-      ;;
-  esac
+  DRY_RUN_OPTIONS+=(--delete)
 fi
 
+echo
+echo "Computing planned changes..."
+
+DRY_RUN_OUTPUT="$(
+  rsync "${DRY_RUN_OPTIONS[@]}" "$SOURCE" "$TARGET"
+)" || {
+  echo "Dry run failed." >&2
+  exit 1
+}
+
+CHANGES=()
+
+while IFS= read -r line; do
+  [[ -n "$line" ]] && CHANGES+=("$line")
+done <<< "$DRY_RUN_OUTPUT"
+
+if ((${#CHANGES[@]} == 0)); then
+  echo
+  echo "No changes."
+  echo "The destination is already synchronized."
+  exit 0
+fi
+
+NEW_FILES=0
+UPDATED_FILES=0
+NEW_DIRECTORIES=0
+DELETED_ITEMS=0
+OTHER_CHANGES=0
+
+for change in "${CHANGES[@]}"; do
+  case "$change" in
+    ">f+++++++++"*)
+      ((NEW_FILES += 1))
+      ;;
+    ">f"*)
+      ((UPDATED_FILES += 1))
+      ;;
+    "cd+++++++++"*)
+      ((NEW_DIRECTORIES += 1))
+      ;;
+    "*deleting "*)
+      ((DELETED_ITEMS += 1))
+      ;;
+    *)
+      ((OTHER_CHANGES += 1))
+      ;;
+  esac
+done
+
+DETAILS_FILE="$(mktemp /tmp/sync-luks-backup-details.XXXXXX.txt)"
+printf '%s\n' "${CHANGES[@]}" > "$DETAILS_FILE"
+
+echo
+echo "Planned changes"
+echo
+printf '  New files       : %d\n' "$NEW_FILES"
+printf '  Updated files   : %d\n' "$UPDATED_FILES"
+printf '  New directories : %d\n' "$NEW_DIRECTORIES"
+printf '  Deleted items   : %d\n' "$DELETED_ITEMS"
+
+if ((OTHER_CHANGES > 0)); then
+  printf '  Other changes   : %d\n' "$OTHER_CHANGES"
+fi
+
+echo
+echo "  Source:      $SOURCE"
+echo "  Destination: $TARGET"
+echo
+echo "Detailed changes:"
+echo "  $DETAILS_FILE"
+echo
+
+if $DELETE; then
+  read -r -p \
+    "Continue and mirror the source, including deletions? [y/N] " \
+    APPLY_ANSWER
+else
+  read -r -p \
+    "Continue with synchronization? [y/N] " \
+    APPLY_ANSWER
+fi
+
+case "$APPLY_ANSWER" in
+  y|Y|yes|YES)
+    if $DELETE; then
+      RSYNC_OPTIONS+=(--delete-delay)
+    fi
+    ;;
+  *)
+    echo "Synchronization cancelled."
+    echo "Details kept at: $DETAILS_FILE"
+    exit 0
+    ;;
+esac
+
+echo
 rsync "${RSYNC_OPTIONS[@]}" "$SOURCE" "$TARGET"
 
 sync
+rm -f "$DETAILS_FILE"
+
 echo
 echo "Backup completed successfully."
