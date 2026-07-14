@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# create-backup
+# create-encrypted-backup
 #
-# Create one encrypted, verified backup from one target in a local output
-# directory.
+# Create one encrypted and verified local backup from one file or directory.
 #
 # The target is processed as follows:
 # - check that enough local space is available
 # - create a local .partial backup directory
-# - write INFO.md
+# - write INFO.md with verification and restore instructions
 # - create and verify an encrypted .tar.age archive
 # - write and verify SHA256SUMS.txt
 # - rename the completed directory to its final name
 #
-# The completed backup remains local and can then be uploaded manually to
-# remote backup storage.
+# Incomplete .partial directories are removed automatically on failure or
+# interruption.
+#
+# The completed backup remains local until it is uploaded or copied to backup
+# storage.
 ###############################################################################
 
 set -euo pipefail
@@ -25,7 +27,7 @@ age_key_arg=""
 output_dir=""
 
 usage() {
-  echo "Usage: create-backup --output-dir=<local-output-directory> [--path-to-age-key=<pass-path>] <target>" >&2
+  echo "Usage: create-encrypted-backup --output-dir=<local-output-directory> [--path-to-age-key=<pass-path>] <target>" >&2
 }
 
 step() {
@@ -179,9 +181,29 @@ fi
 
 if [ -e "$partial_backup" ]; then
   echo "Error: partial backup already exists: $partial_backup" >&2
-  echo "Remove it manually if it comes from an interrupted previous run." >&2
   exit 1
 fi
+
+cleanup_partial() {
+  local exit_status=$?
+
+  trap - EXIT HUP INT TERM
+
+  if [ "$exit_status" -ne 0 ] && [ -d "$partial_backup" ]; then
+    echo
+    echo "Removing incomplete backup:"
+    echo "$partial_backup"
+
+    rm -rf -- "$partial_backup"
+  fi
+
+  exit "$exit_status"
+}
+
+trap cleanup_partial EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 step 1 "Prepare local backup for $target"
 
@@ -213,6 +235,41 @@ step 2 "Write INFO.md"
   echo '```text'
   du -h --max-depth=3 "$target" | sort -h
   echo '```'
+  echo
+  echo "## Verify"
+  echo
+  echo '```bash'
+  echo "sha256sum -c SHA256SUMS.txt"
+  echo '```'
+  echo
+  echo "## Inspect"
+  echo
+  echo '```bash'
+
+  if [ -n "$age_key_arg" ]; then
+    pass_path="${age_key_arg#--path-to-age-key=}"
+
+    printf 'age -d -i <(pass show %q) ./*.tar.age | tar -tf -\n' \
+      "$pass_path"
+  else
+    echo "age -d ./*.tar.age | tar -tf -"
+  fi
+
+  echo '```'
+  echo
+  echo "## Extract"
+  echo
+  echo '```bash'
+  echo "mkdir restored"
+
+  if [ -n "$age_key_arg" ]; then
+    printf 'age -d -i <(pass show %q) ./*.tar.age | tar -xf - -C restored\n' \
+      "$pass_path"
+  else
+    echo "age -d ./*.tar.age | tar -xf - -C restored"
+  fi
+
+  echo '```'
 } > "$info_file"
 
 step 3 "Create and verify encrypted archive"
@@ -228,17 +285,11 @@ step 4 "Create checksums and finalize backup"
 sha256sum ./*.tar.age | tee "$checksum_file"
 sha256sum -c "$checksum_file"
 
-{
-  echo
-  echo "## Encrypted archive SHA-256"
-  echo
-  echo '```text'
-  cat "$checksum_file"
-  echo '```'
-} >> "$info_file"
-
 cd "$backup_output_dir"
 mv "$partial_backup" "$final_backup"
+
+# The backup is now finalized. Disable automatic cleanup.
+trap - EXIT HUP INT TERM
 
 echo
 echo "Completed backup:"

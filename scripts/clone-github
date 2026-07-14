@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
-set -euo pipefail
+
+###############################################################################
+# clone-github
+#
+# Clone all repositories from one GitHub user or organization into a dated
+# local directory.
+#
+# Repositories are first cloned into a .partial directory. The directory is
+# renamed to its final name only after every clone has completed successfully.
+# Incomplete directories are removed automatically on failure or interruption.
+###############################################################################
+
+set -Eeuo pipefail
+umask 077
 
 usage() {
   echo "Usage: clone-github <github-username-or-org>" >&2
@@ -11,11 +24,20 @@ if [ "$#" -ne 1 ]; then
 fi
 
 owner="$1"
-backup_dir="backup-$(date +%y%m%d)"
+run_id="$(date +%y%m%d-%H%M%S)"
+
+backup_dir="backup-$run_id"
+partial_dir="$backup_dir.partial"
 
 if ! command -v gh >/dev/null 2>&1; then
   echo "Error: GitHub CLI is not installed: gh" >&2
-  echo "Install it first, then run: gh auth login" >&2
+  echo "Install it, then run: gh auth login" >&2
+  exit 1
+fi
+
+if ! gh auth status >/dev/null 2>&1; then
+  echo "Error: GitHub CLI is not authenticated." >&2
+  echo "Run: gh auth login" >&2
   exit 1
 fi
 
@@ -24,17 +46,74 @@ if [ -e "$backup_dir" ]; then
   exit 1
 fi
 
-mkdir -p "$backup_dir"
+if [ -e "$partial_dir" ]; then
+  echo "Error: partial directory already exists: $partial_dir" >&2
+  exit 1
+fi
 
-gh repo list "$owner" --limit 4000 --json nameWithOwner --jq '.[].nameWithOwner' |
-while IFS= read -r repo; do
-  target="$backup_dir/$repo"
+cleanup_partial() {
+  local exit_status=$?
+
+  trap - EXIT HUP INT TERM
+
+  if [ "$exit_status" -ne 0 ] && [ -d "$partial_dir" ]; then
+    echo
+    echo "Removing incomplete GitHub backup:"
+    echo "$partial_dir"
+
+    rm -rf -- "$partial_dir"
+  fi
+
+  exit "$exit_status"
+}
+
+trap cleanup_partial EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+mkdir -p "$partial_dir"
+
+echo "Fetching repository list for: $owner"
+
+mapfile -t repositories < <(
+  gh repo list "$owner" \
+    --limit 4000 \
+    --json nameWithOwner \
+    --jq '.[].nameWithOwner'
+)
+
+if ((${#repositories[@]} == 0)); then
+  echo "Error: no repositories found for: $owner" >&2
+  exit 1
+fi
+
+echo "Repositories: ${#repositories[@]}"
+echo "Working:     $partial_dir"
+echo "Final:       $backup_dir"
+echo
+
+current=0
+
+for repository in "${repositories[@]}"; do
+  ((current += 1))
+
+  target="$partial_dir/$repository"
+
   mkdir -p "$(dirname "$target")"
 
-  echo "Cloning: $repo"
-  gh repo clone "$repo" "$target"
+  printf '[%d/%d] Cloning: %s\n' \
+    "$current" \
+    "${#repositories[@]}" \
+    "$repository"
+
+  gh repo clone "$repository" "$target"
 done
 
+mv "$partial_dir" "$backup_dir"
+
+trap - EXIT HUP INT TERM
+
 echo
-echo "Done:"
+echo "Completed GitHub backup:"
 echo "$backup_dir"

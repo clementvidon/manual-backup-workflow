@@ -1,25 +1,120 @@
 # Backup Workflow
 
-This workflow manually backs up personal files, external data sources, and machine recovery data.
+This workflow backs up personal files, external data sources, and machine recovery data.
+
+## Storage roles
+
+### Laptop
+
+The laptop contains the current working data:
+
+```text
+~/Documents/
+~/Desktop/
+```
+
+Persistent Desktop directories used by this workflow:
+
+```text
+~/Desktop/
+├── Works/
+├── Chores/
+└── Backups/
+```
+
+`Backups/` contains finalized encrypted backups of external sources and machine recovery data.
+
+The workflow also uses two temporary directories:
+
+```text
+~/Desktop/Backups-staging/
+~/Desktop/Ready-to-upload/
+```
+
+* `Backups-staging/` temporarily contains clear-text data collected from external sources.
+* `Ready-to-upload/` temporarily contains encrypted snapshots awaiting upload.
+
+Both directories may be removed when empty and recreated by the workflow when needed.
+
+### Cloud
+
+Cloud is the primary remote backup location:
+
+```text
+Cloud/
+├── Archives/
+└── Manual Backup/
+    ├── Documents/
+    ├── Works/
+    ├── Chores/
+    └── Backups/
+```
+
+* `Archives/` contains long-term media archives. See my [Photography Archiving Workflow](https://github.com/clementvidon/photography-archiving-workflow).
+* `Manual Backup/Documents/` contains encrypted snapshots of `~/Documents`.
+* `Manual Backup/Works/` contains encrypted snapshots of `~/Desktop/Works`.
+* `Manual Backup/Chores/` contains encrypted snapshots of `~/Desktop/Chores`.
+* `Manual Backup/Backups/` contains encrypted external-source and machine-recovery backups.
+
+Retention is managed manually: keep the two most recent verified generations of each important backup.
+
+### Encrypted hard disk
+
+The encrypted hard disk contains a local mirror of:
+
+```text
+Cloud/Archives/
+```
+
+It protects access to the archives if the Cloud account becomes unavailable or inaccessible.
+
+---
 
 ## 0. Configure paths
 
-Run the workflow commands **in the same shell session**.
+Run the commands in the same shell session.
 
 ```bash
 AGE_KEY_PASS_PATH="backup/age-key"
-EXTERNAL_SOURCES_BACKUPS_DIR="$HOME/Desktop/Backups"
+
+BACKUP_STAGING_DIR="$HOME/Desktop/Backups-staging"
+LOCAL_BACKUPS_DIR="$HOME/Desktop/Backups"
 BACKUP_OUTPUT_DIR="$HOME/Desktop/Ready-to-upload"
 
-mkdir -p "$EXTERNAL_SOURCES_BACKUPS_DIR"
+CLOUD_NAME="pCloud"
+CLOUD_ARCHIVES_DIR="$HOME/pCloudDrive/Archives"
+
+mkdir -p "$BACKUP_STAGING_DIR"
+mkdir -p "$LOCAL_BACKUPS_DIR"
 mkdir -p "$BACKUP_OUTPUT_DIR"
 ```
 
+`Backups-staging/` and `Ready-to-upload/` must not be synchronized automatically to Cloud.
+
+---
+
 ## 1. Prepare external data sources
 
-Copy files from external devices, services, or storage locations into `$EXTERNAL_SOURCES_BACKUPS_DIR` if needed.
+Export or copy data from external devices and services into:
 
-See [`EXTERNAL-DATA-SOURCES.md`](./EXTERNAL-DATA-SOURCES.md) for source-specific workflows.
+```text
+~/Desktop/Backups-staging/
+```
+
+Example:
+
+```text
+~/Desktop/Backups-staging/
+├── Phone/
+├── GitHub/
+├── Notion/
+├── Kindle/
+└── Other-device/
+```
+
+See [`EXTERNAL-DATA-SOURCES.md`](./EXTERNAL-DATA-SOURCES.md) for source-specific instructions.
+
+---
 
 ## 2. Prepare machine recovery data
 
@@ -33,14 +128,17 @@ backup-user-apps "$MACHINE_BACKUP_DIR"
 backup-machine-state "$MACHINE_BACKUP_DIR"
 ```
 
-The clear machine recovery directory is created temporarily under `/tmp`. Remove it after `backup`
-has successfully created and verified the corresponding encrypted backup in `$BACKUP_OUTPUT_DIR`.
+Machine recovery data is created temporarily under `/tmp` and must not be uploaded in clear text.
 
-## 3. Encrypt and backup the machine recovery data
+---
+
+## 3. Create the machine recovery backup
 
 ```bash
-if backup \
-  --output-dir="$BACKUP_OUTPUT_DIR" \
+mkdir -p "$LOCAL_BACKUPS_DIR/Machine"
+
+if create-encrypted-backup \
+  --output-dir="$LOCAL_BACKUPS_DIR/Machine" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
   "$MACHINE_BACKUP_DIR"
 then
@@ -49,85 +147,245 @@ then
 fi
 ```
 
-## 4. Encrypt and backup the personal files
+---
 
-`backup` checks the available space in `$BACKUP_OUTPUT_DIR` before starting. It requires enough space
-for the source plus a 10% safety margin, with a minimum margin of 2 GiB.
+## 4. Create external-source backups
 
-Run each backup separately. To limit local disk usage, upload and remove each completed backup before
-creating the next one.
+Create each encrypted backup independently.
 
 ```bash
-create-backup \
-  --output-dir="$BACKUP_OUTPUT_DIR" \
+create-encrypted-backup \
+  --output-dir="$LOCAL_BACKUPS_DIR/GitHub" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
-  "$HOME/Documents"
+  "$BACKUP_STAGING_DIR/GitHub"
+
+create-encrypted-backup \
+  --output-dir="$LOCAL_BACKUPS_DIR/Kindle" \
+  --path-to-age-key="$AGE_KEY_PASS_PATH" \
+  "$BACKUP_STAGING_DIR/Kindle"
+
+create-encrypted-backup \
+  --output-dir="$LOCAL_BACKUPS_DIR/Notion" \
+  --path-to-age-key="$AGE_KEY_PASS_PATH" \
+  "$BACKUP_STAGING_DIR/Notion"
+
+create-encrypted-backup \
+  --output-dir="$LOCAL_BACKUPS_DIR/Phone" \
+  --path-to-age-key="$AGE_KEY_PASS_PATH" \
+  "$BACKUP_STAGING_DIR/Phone"
 ```
 
+Run only the commands corresponding to the sources currently present in `Backups-staging/`.
+
+Completed backups are stored as:
+
+```text
+~/Desktop/Backups/
+├── GitHub/
+│   ├── GitHub-backup-<older-run-id>/
+│   └── GitHub-backup-<newer-run-id>/
+├── Phone/
+├── Notion/
+├── Kindle/
+└── Other-device/
+```
+
+Each completed backup contains:
+
+```text
+INFO.md
+SHA256SUMS.txt
+<source>.tar.age
+```
+
+`create-encrypted-backup` creates and verifies the encrypted archive and its checksum before finalizing the backup directory.
+
+---
+
+## 5. Remove the staging data
+
+After all external-source backups have completed successfully, remove the staging directory and its clear-text contents:
+
 ```bash
-create-backup \
-  --output-dir="$BACKUP_OUTPUT_DIR" \
+rm -rf "$BACKUP_STAGING_DIR"
+```
+
+It will be recreated during the next backup run.
+
+Do not remove it while an expected source has not yet been backed up successfully.
+
+---
+
+## 6. Create personal-file snapshots
+
+`Documents`, `Works`, and `Chores` remain in clear text on the laptop but are stored only as encrypted snapshots on Cloud.
+
+The commands below use an age key stored in `pass`.
+Remove `--path-to-age-key="$AGE_KEY_PASS_PATH"` to use password-based encryption.
+
+When local space is limited, create, upload, and remove each snapshot before creating the next one.
+
+```bash
+mkdir -p "$BACKUP_OUTPUT_DIR/Chores"
+create-encrypted-backup \
+  --output-dir="$BACKUP_OUTPUT_DIR/Chores" \
+  --path-to-age-key="$AGE_KEY_PASS_PATH" \
+  "$HOME/Desktop/Chores"
+
+mkdir -p "$BACKUP_OUTPUT_DIR/Documents"
+create-encrypted-backup \
+  --output-dir="$BACKUP_OUTPUT_DIR/Documents" \
+  --path-to-age-key="$AGE_KEY_PASS_PATH" \
+  "$HOME/Documents"
+
+mkdir -p "$BACKUP_OUTPUT_DIR/Works"
+create-encrypted-backup \
+  --output-dir="$BACKUP_OUTPUT_DIR/Works" \
   --path-to-age-key="$AGE_KEY_PASS_PATH" \
   "$HOME/Desktop/Works"
 ```
 
-```bash
-create-backup \
-  --output-dir="$BACKUP_OUTPUT_DIR" \
-  --path-to-age-key="$AGE_KEY_PASS_PATH" \
-  "$HOME/Desktop/Chores"
+---
+
+## 7. Upload completed backups
+
+Use the Cloud upload feature to transfer only completed backup directories.
+Do not configure `Backups/` or `Ready-to-upload/` for automatic synchronization.
+
+Upload personal-file snapshots:
+
+```text
+Ready-to-upload/Documents/  → Manual Backup/Documents/
+Ready-to-upload/Works/      → Manual Backup/Works/
+Ready-to-upload/Chores/     → Manual Backup/Chores/
 ```
 
-```bash
-create-backup \
-  --output-dir="$BACKUP_OUTPUT_DIR" \
-  --path-to-age-key="$AGE_KEY_PASS_PATH" \
-  "$EXTERNAL_SOURCES_BACKUPS_DIR"
+Upload external-source and machine backups:
+
+```text
+Backups/<source>/<new-backup-directory>/ → Manual Backup/Backups/<source>/
 ```
 
-Remove `--path-to-age-key="$AGE_KEY_PASS_PATH"` to use password-based encryption.
+Recommended remote structure:
 
-## 5. Upload the completed backups
-
-Completed encrypted backups are stored under `$BACKUP_OUTPUT_DIR`.
-
-Upload each completed backup directory manually to your remote backup storage.
-
-Do not remove the local copy until the upload has completed successfully.
-
-Optional local verification before or after upload:
-
-```bash
-cd "$BACKUP_OUTPUT_DIR/<backup-directory>"
-sha256sum -c SHA256SUMS.txt
+```text
+Cloud/Manual Backup/
+├── Documents/
+│   ├── Documents-backup-<older-run-id>/
+│   └── Documents-backup-<newer-run-id>/
+├── Works/
+│   ├── Works-backup-<older-run-id>/
+│   └── Works-backup-<newer-run-id>/
+├── Chores/
+│   ├── Chores-backup-<older-run-id>/
+│   └── Chores-backup-<newer-run-id>/
+└── Backups/
+    ├── Machine/
+    ├── Phone/
+    ├── GitHub/
+    ├── Notion/
+    ├── Kindle/
+    └── Other-device/
 ```
 
-After confirming that the remote copy is complete, remove the local backup:
+Delete an older generation only after the newer one has been:
+
+1. created and verified successfully;
+2. uploaded completely;
+3. confirmed present on Cloud.
+
+---
+
+## 8. Remove uploaded personal snapshots
+
+After confirming that all personal snapshots have been uploaded successfully, remove the temporary upload directory:
 
 ```bash
-rm -rf "$BACKUP_OUTPUT_DIR/<backup-directory>"
+rm -rf "$BACKUP_OUTPUT_DIR"
 ```
 
-## Restore
+Backups under `~/Desktop/Backups` are retained as an encrypted local copy.
 
-Decrypt and inspect an archive:
+---
+
+## 9. Synchronize Cloud Archives to the hard disk
 
 ```bash
-age -d backup.tar.age | tar -tf -
+sync-luks-backup \
+  --source "$CLOUD_ARCHIVES_DIR/" \
+  --destination "$CLOUD_NAME/Archives/" \
+  --luks-uuid "52936657-45cb-4718-b305-19698ca1cbf7" \
+  --mapper "backup" \
+  --mount-point "/mnt/backup" \
+  --delete
 ```
 
-Extract an archive:
+Review the planned changes before confirming the synchronization.
+
+The hard disk mirrors only `Cloud/Archives`. It does not provide versioning for those archives.
+
+---
+
+## 10. Restore
+
+Inspect an encrypted archive:
+
+```bash
+age -d ./*.tar.age | tar -tf -
+```
+
+Extract it:
 
 ```bash
 mkdir restored
-age -d backup.tar.age | tar -xf - -C restored
+
+age -d ./*.tar.age | tar -xf - -C restored
 ```
 
-For `pass` / YubiKey mode:
+With a key stored in `pass`:
 
 ```bash
 AGE_KEY_PASS_PATH="backup/age-key"
 
 mkdir restored
-age -d -i <(pass show "$AGE_KEY_PASS_PATH") backup.tar.age | tar -xf - -C restored
+
+age -d \
+  -i <(pass show "$AGE_KEY_PASS_PATH") \
+  ./*.tar.age |
+  tar -xf - -C restored
+```
+
+Restore into a new directory and inspect the result before replacing existing files.
+
+---
+
+## Summary
+
+```text
+Laptop
+├── Documents/                  current working data
+└── Desktop/
+    ├── Works/                  current working data
+    ├── Chores/                 current working data
+    ├── Backups/                durable encrypted source backups
+    ├── Backups-staging/        temporary clear-text source data
+    └── Ready-to-upload/        temporary encrypted snapshots
+
+Cloud
+├── Archives/                   primary long-term archive storage
+└── Manual Backup/
+    ├── Documents/              encrypted snapshots
+    ├── Works/                  encrypted snapshots
+    ├── Chores/                 encrypted snapshots
+    └── Backups/                encrypted source and recovery backups
+
+Encrypted hard disk
+└── Cloud/
+    └── Archives/               local mirror of Cloud/Archives
+```
+
+```text
+Laptop = current working data
+Cloud = primary remote backup
+Hard disk = local copy of Cloud Archives
 ```

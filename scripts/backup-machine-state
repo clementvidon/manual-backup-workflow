@@ -60,7 +60,7 @@ echo
 echo "[2/3] Archiving /etc"
 
 sudo tar -cpf "$backup_dir/etc.tar" -C / etc
-sudo chown "$USER:$USER" "$backup_dir/etc.tar"
+sudo chown "$USER:$(id -gn)" "$backup_dir/etc.tar"
 chmod 600 "$backup_dir/etc.tar"
 
 echo
