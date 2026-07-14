@@ -2,25 +2,17 @@
 set -Eeuo pipefail
 
 usage() {
-  cat <<'EOF'
+  cat <<'USAGE'
 Usage:
   sync-luks-backup \
     --source <directory> \
-    --destination <directory> \
+    --destination <relative-directory> \
     --luks-uuid <uuid> \
     [--mapper <name>] \
     [--mount-point <directory>] \
+    [--trash-dir <relative-directory>] \
     [--delete]
-
-Example:
-  sync-luks-backup \
-    --source "$HOME/pCloudDrive/Archives/" \
-    --destination "Archives/" \
-    --luks-uuid "52936657-45cb-4718-b305-19698ca1cbf7" \
-    --mapper "backup" \
-    --mount-point "/mnt/backup" \
-    --delete
-EOF
+USAGE
 }
 
 SOURCE=""
@@ -28,46 +20,25 @@ DESTINATION=""
 LUKS_UUID=""
 MAPPER="backup"
 MOUNT_POINT="/mnt/backup"
+TRASH_DIR="Trash"
 DELETE=false
 
-OPENED_BY_SCRIPT=false
 MOUNTED_BY_SCRIPT=false
+OPENED_BY_SCRIPT=false
+REPORT_FILE=""
+KEEP_REPORT=false
 
 while (($#)); do
   case "$1" in
-    --source)
-      SOURCE="${2:?Missing value for --source}"
-      shift 2
-      ;;
-    --destination)
-      DESTINATION="${2:?Missing value for --destination}"
-      shift 2
-      ;;
-    --luks-uuid)
-      LUKS_UUID="${2:?Missing value for --luks-uuid}"
-      shift 2
-      ;;
-    --mapper)
-      MAPPER="${2:?Missing value for --mapper}"
-      shift 2
-      ;;
-    --mount-point)
-      MOUNT_POINT="${2:?Missing value for --mount-point}"
-      shift 2
-      ;;
-    --delete)
-      DELETE=true
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "Unknown option: $1" >&2
-      usage >&2
-      exit 2
-      ;;
+    --source)       SOURCE="${2:?Missing value for --source}"; shift 2 ;;
+    --destination)  DESTINATION="${2:?Missing value for --destination}"; shift 2 ;;
+    --luks-uuid)     LUKS_UUID="${2:?Missing value for --luks-uuid}"; shift 2 ;;
+    --mapper)        MAPPER="${2:?Missing value for --mapper}"; shift 2 ;;
+    --mount-point)   MOUNT_POINT="${2:?Missing value for --mount-point}"; shift 2 ;;
+    --trash-dir)     TRASH_DIR="${2:?Missing value for --trash-dir}"; shift 2 ;;
+    --delete)        DELETE=true; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
@@ -77,12 +48,29 @@ done
 }
 
 for command in \
+  awk \
   cryptsetup \
+  date \
+  df \
+  find \
   findmnt \
+  grep \
+  id \
+  install \
   lsblk \
+  mkdir \
+  mktemp \
+  mount \
   mountpoint \
+  numfmt \
+  realpath \
+  rm \
+  rmdir \
   rsync \
+  sudo \
   sync \
+  tail \
+  tr \
   umount; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "Required command not found: $command" >&2
@@ -90,116 +78,138 @@ for command in \
   }
 done
 
+validate_relative_path() {
+  local name="$1"
+  local path="$2"
+
+  [[ -n "$path" && "$path" != /* ]] || {
+    echo "$name must be a non-empty path relative to the backup volume." >&2
+    exit 2
+  }
+
+  case "/$path/" in
+    */../*|*/./*)
+      echo "$name must not contain '.' or '..' path components." >&2
+      exit 2
+      ;;
+  esac
+}
+
+validate_relative_path "--destination" "$DESTINATION"
+validate_relative_path "--trash-dir" "$TRASH_DIR"
+
+DESTINATION="${DESTINATION#/}"
+DESTINATION="${DESTINATION%/}"
+TRASH_DIR="${TRASH_DIR#/}"
+TRASH_DIR="${TRASH_DIR%/}"
+SOURCE="${SOURCE%/}/"
+
+[[ "$MOUNT_POINT" == /* && "$MOUNT_POINT" != "/" ]] || {
+  echo "--mount-point must be an absolute path other than /." >&2
+  exit 2
+}
+[[ "$MAPPER" =~ ^[A-Za-z0-9._+-]+$ ]] || {
+  echo "Invalid --mapper name: $MAPPER" >&2
+  exit 2
+}
+
+MOUNT_POINT="${MOUNT_POINT%/}"
+
+[[ "$DESTINATION" != "$TRASH_DIR" &&
+   "$DESTINATION" != "$TRASH_DIR"/* &&
+   "$TRASH_DIR" != "$DESTINATION"/* ]] || {
+  echo "--destination and --trash-dir must not overlap." >&2
+  exit 2
+}
+
 [[ -d "$SOURCE" ]] || {
   echo "Source unavailable: $SOURCE" >&2
   exit 1
 }
 
-[[ "$DESTINATION" != /* ]] || {
-  echo "--destination must be relative to the backup volume." >&2
-  exit 2
-}
-
-[[ "$DESTINATION" != "." &&
-   "$DESTINATION" != ".." &&
-   "$DESTINATION" != ../* &&
-   "$DESTINATION" != */../* &&
-   "$DESTINATION" != */.. ]] || {
-  echo "--destination must not contain '..' path components." >&2
-  exit 2
+SOURCE_SENTINEL="${SOURCE}.archive-root"
+[[ -f "$SOURCE_SENTINEL" ]] || {
+  echo "Source safety marker not found: $SOURCE_SENTINEL" >&2
+  echo "Refusing to synchronize an unexpected or incomplete source." >&2
+  exit 1
 }
 
 LUKS_DEVICE="/dev/disk/by-uuid/$LUKS_UUID"
-
 [[ -e "$LUKS_DEVICE" ]] || {
   echo "LUKS device not found: $LUKS_DEVICE" >&2
   exit 1
 }
-
-LUKS_DEVICE="$(readlink -f "$LUKS_DEVICE")"
+LUKS_DEVICE="$(realpath "$LUKS_DEVICE")"
 
 [[ "$(lsblk -dnro FSTYPE "$LUKS_DEVICE")" == "crypto_LUKS" ]] || {
   echo "Device is not a LUKS container: $LUKS_DEVICE" >&2
   exit 1
 }
 
-SOURCE="${SOURCE%/}/"
-MOUNT_POINT="${MOUNT_POINT%/}"
-TARGET="${MOUNT_POINT}/${DESTINATION#/}"
-TARGET="${TARGET%/}/"
-
 cleanup() {
   local status=$?
+  local cleanup_failed=false
 
-  trap - EXIT INT TERM
+  trap - EXIT HUP INT TERM
 
-  if $MOUNTED_BY_SCRIPT && mountpoint -q "$MOUNT_POINT"; then
-    echo
-    echo "Unmounting $MOUNT_POINT..."
-    sudo umount "$MOUNT_POINT" || true
+  if $MOUNTED_BY_SCRIPT; then
+    if mountpoint -q "$MOUNT_POINT"; then
+      echo
+      echo "Unmounting $MOUNT_POINT..."
+
+      if sudo umount "$MOUNT_POINT"; then
+        MOUNTED_BY_SCRIPT=false
+      else
+        echo "Warning: unable to unmount $MOUNT_POINT; mapper left open." >&2
+        cleanup_failed=true
+      fi
+    else
+      MOUNTED_BY_SCRIPT=false
+    fi
   fi
 
-  if $OPENED_BY_SCRIPT &&
+  # Never close a mapper while its filesystem may still be mounted.
+  if ! $MOUNTED_BY_SCRIPT &&
+     $OPENED_BY_SCRIPT &&
      sudo cryptsetup status "$MAPPER" >/dev/null 2>&1; then
     echo "Closing LUKS mapper $MAPPER..."
-    sudo cryptsetup close "$MAPPER" || true
+
+    if sudo cryptsetup close "$MAPPER"; then
+      OPENED_BY_SCRIPT=false
+    else
+      echo "Warning: unable to close mapper $MAPPER." >&2
+      cleanup_failed=true
+    fi
+  fi
+
+  if $cleanup_failed; then
+    status=1
+    KEEP_REPORT=true
+  fi
+
+  if [[ -n "$REPORT_FILE" ]] && ! $KEEP_REPORT; then
+    rm -f -- "$REPORT_FILE"
   fi
 
   exit "$status"
 }
 
 trap cleanup EXIT
+trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-normalize_luks_state() {
-  local mapped_device
-  local mapper_name
-  local mount_target
+if [[ -e "/dev/mapper/$MAPPER" ]]; then
+  echo "Mapper already exists: /dev/mapper/$MAPPER" >&2
+  echo "Close it first or choose another --mapper name." >&2
+  exit 1
+fi
 
-  mapfile -t EXISTING_MAPPERS < <(
-    lsblk -nrpo NAME,TYPE "$LUKS_DEVICE" |
-      awk '$2 == "crypt" { print $1 }'
-  )
-
-  if ((${#EXISTING_MAPPERS[@]} == 0)); then
-    return
-  fi
-
-  echo
-  echo "The LUKS volume is already open. Normalizing its state..."
-
-  for mapped_device in "${EXISTING_MAPPERS[@]}"; do
-    mapper_name="$(basename "$mapped_device")"
-
-    mapfile -t MOUNT_TARGETS < <(
-      findmnt -rn -S "$mapped_device" -o TARGET || true
-    )
-
-    for mount_target in "${MOUNT_TARGETS[@]}"; do
-      [[ -n "$mount_target" ]] || continue
-
-      echo "Unmounting existing mount: $mount_target"
-
-      if ! sudo umount "$mount_target"; then
-        echo "Unable to unmount $mount_target." >&2
-        echo "Close any application using the volume and try again." >&2
-        exit 1
-      fi
-    done
-
-    if sudo cryptsetup status "$mapper_name" >/dev/null 2>&1; then
-      echo "Closing existing mapper: $mapper_name"
-
-      if ! sudo cryptsetup close "$mapper_name"; then
-        echo "Unable to close mapper: $mapper_name" >&2
-        exit 1
-      fi
-    fi
-  done
-}
-
-normalize_luks_state
+if mountpoint -q "$MOUNT_POINT"; then
+  echo "Mount point is already in use: $MOUNT_POINT" >&2
+  echo "Unmount it first or choose another --mount-point." >&2
+  exit 1
+fi
 
 echo
 echo "Opening LUKS volume as $MAPPER..."
@@ -207,167 +217,241 @@ sudo cryptsetup open "$LUKS_DEVICE" "$MAPPER"
 OPENED_BY_SCRIPT=true
 
 MAPPED_DEVICE="/dev/mapper/$MAPPER"
-
 [[ -b "$MAPPED_DEVICE" ]] || {
   echo "Mapped device unavailable: $MAPPED_DEVICE" >&2
   exit 1
 }
 
 sudo mkdir -p "$MOUNT_POINT"
-
 echo "Mounting $MAPPED_DEVICE at $MOUNT_POINT..."
 sudo mount "$MAPPED_DEVICE" "$MOUNT_POINT"
 MOUNTED_BY_SCRIPT=true
 
-MOUNTED_SOURCE="$(findmnt -n -o SOURCE --target "$MOUNT_POINT")"
-MOUNTED_SOURCE="$(readlink -f "$MOUNTED_SOURCE")"
-EXPECTED_SOURCE="$(readlink -f "$MAPPED_DEVICE")"
-
+MOUNTED_SOURCE="$(realpath "$(findmnt -n -o SOURCE --target "$MOUNT_POINT")")"
+EXPECTED_SOURCE="$(realpath "$MAPPED_DEVICE")"
 [[ "$MOUNTED_SOURCE" == "$EXPECTED_SOURCE" ]] || {
-  echo "Unexpected device mounted at $MOUNT_POINT:" >&2
-  echo "  Expected: $EXPECTED_SOURCE" >&2
-  echo "  Found:    $MOUNTED_SOURCE" >&2
+  echo "Unexpected device mounted at $MOUNT_POINT." >&2
+  echo "Expected: $EXPECTED_SOURCE" >&2
+  echo "Found:    $MOUNTED_SOURCE" >&2
   exit 1
 }
 
 MOUNT_OPTIONS="$(findmnt -n -o OPTIONS --target "$MOUNT_POINT")"
-
 [[ ",$MOUNT_OPTIONS," == *,rw,* ]] || {
   echo "Backup volume is not mounted read-write." >&2
-  echo "Mount options: $MOUNT_OPTIONS" >&2
+  exit 1
+}
+
+MOUNT_REAL="$(realpath "$MOUNT_POINT")"
+
+TARGET_REAL="$(realpath -m "$MOUNT_REAL/$DESTINATION")"
+TRASH_REAL="$(realpath -m "$MOUNT_REAL/$TRASH_DIR")"
+
+[[ "$TARGET_REAL" == "$MOUNT_REAL/"* ]] || {
+  echo "Resolved destination escapes the backup volume: $TARGET_REAL" >&2
+  exit 1
+}
+
+[[ "$TRASH_REAL" == "$MOUNT_REAL/"* ]] || {
+  echo "Resolved Trash directory escapes the backup volume: $TRASH_REAL" >&2
+  exit 1
+}
+
+[[ "$TARGET_REAL" != "$TRASH_REAL" &&
+   "$TARGET_REAL" != "$TRASH_REAL/"* &&
+   "$TRASH_REAL" != "$TARGET_REAL/"* ]] || {
+  echo "Resolved destination and Trash directories overlap:" >&2
+  echo "  Destination: $TARGET_REAL" >&2
+  echo "  Trash:       $TRASH_REAL" >&2
   exit 1
 }
 
 sudo install \
   -d \
-  -o "$USER" \
+  -o "$(id -un)" \
   -g "$(id -gn)" \
-  "$TARGET"
+  -- \
+  "$TARGET_REAL" \
+  "$TRASH_REAL"
 
-[[ -w "$TARGET" ]] || {
-  echo "Destination is not writable: $TARGET" >&2
+[[ -w "$TARGET_REAL" && -w "$TRASH_REAL" ]] || {
+  echo "Destination or Trash directory is not writable." >&2
   exit 1
 }
 
-RSYNC_OPTIONS=(
+TARGET="${TARGET_REAL%/}/"
+TRASH_RUN_DIR="$TRASH_REAL/$(date +%Y%m%d-%H%M%S)"
+
+COMMON_OPTIONS=(
   --archive
-  --human-readable
   --partial
-  --no-inc-recursive
-  --info=progress2
+  --partial-dir=.rsync-partial
+  --exclude=.rsync-partial/
 )
 
 DRY_RUN_OPTIONS=(
-  --archive
-  --human-readable
+  "${COMMON_OPTIONS[@]}"
   --dry-run
   --itemize-changes
+  --stats
 )
 
 if $DELETE; then
   DRY_RUN_OPTIONS+=(--delete)
 fi
 
+REPORT_FILE="$(mktemp /tmp/sync-luks-backup.XXXXXX.txt)"
+
 echo
 echo "Computing planned changes..."
+if ! LC_ALL=C rsync "${DRY_RUN_OPTIONS[@]}" "$SOURCE" "$TARGET" >"$REPORT_FILE"; then
+  KEEP_REPORT=true
+  echo "Dry run failed. Report kept at: $REPORT_FILE" >&2
+  exit 1
+fi
 
-DRY_RUN_OUTPUT="$(
-  rsync "${DRY_RUN_OPTIONS[@]}" "$SOURCE" "$TARGET"
-)" || {
-  echo "Dry run failed." >&2
+CHANGE_COUNT="$(grep -Ec '^(\*deleting |[<>ch.*][^ ]{10} )' "$REPORT_FILE" || true)"
+DELETE_COUNT="$(grep -c '^\*deleting ' "$REPORT_FILE" || true)"
+TRANSFER_BYTES="$(
+  awk -F': ' '
+    /^Total transferred file size:/ {
+      split($2, value, /[[:space:]]+/)
+      gsub(/,/, "", value[1])
+      print value[1]
+      exit
+    }
+  ' "$REPORT_FILE"
+)"
+
+[[ "$TRANSFER_BYTES" =~ ^[0-9]+$ ]] || {
+  KEEP_REPORT=true
+  echo "Unable to determine transfer size. Report kept at: $REPORT_FILE" >&2
   exit 1
 }
 
-CHANGES=()
-
-while IFS= read -r line; do
-  [[ -n "$line" ]] && CHANGES+=("$line")
-done <<< "$DRY_RUN_OUTPUT"
-
-if ((${#CHANGES[@]} == 0)); then
-  echo
-  echo "No changes."
-  echo "The destination is already synchronized."
+if ((CHANGE_COUNT == 0)); then
+  echo "No changes. The destination is already synchronized."
   exit 0
 fi
 
-NEW_FILES=0
-UPDATED_FILES=0
-NEW_DIRECTORIES=0
-DELETED_ITEMS=0
-OTHER_CHANGES=0
+AVAILABLE_BYTES="$(
+  df --output=avail -B1 "$MOUNT_POINT" |
+    tail -n 1 |
+    tr -d '[:space:]'
+)"
 
-for change in "${CHANGES[@]}"; do
-  case "$change" in
-    ">f+++++++++"*)
-      ((NEW_FILES += 1))
-      ;;
-    ">f"*)
-      ((UPDATED_FILES += 1))
-      ;;
-    "cd+++++++++"*)
-      ((NEW_DIRECTORIES += 1))
-      ;;
-    "*deleting "*)
-      ((DELETED_ITEMS += 1))
-      ;;
-    *)
-      ((OTHER_CHANGES += 1))
-      ;;
-  esac
-done
+[[ "$AVAILABLE_BYTES" =~ ^[0-9]+$ ]] || {
+  KEEP_REPORT=true
+  echo "Unable to determine available disk space." >&2
+  echo "Report kept at: $REPORT_FILE" >&2
+  exit 1
+}
 
-DETAILS_FILE="$(mktemp /tmp/sync-luks-backup-details.XXXXXX.txt)"
-printf '%s\n' "${CHANGES[@]}" > "$DETAILS_FILE"
+if ((TRANSFER_BYTES == 0)); then
+  SAFETY_MARGIN=0
+else
+  MIN_MARGIN=$((2 * 1024 * 1024 * 1024))
+  PERCENT_MARGIN=$((TRANSFER_BYTES / 10))
 
-echo
-echo "Planned changes"
-echo
-printf '  New files       : %d\n' "$NEW_FILES"
-printf '  Updated files   : %d\n' "$UPDATED_FILES"
-printf '  New directories : %d\n' "$NEW_DIRECTORIES"
-printf '  Deleted items   : %d\n' "$DELETED_ITEMS"
-
-if ((OTHER_CHANGES > 0)); then
-  printf '  Other changes   : %d\n' "$OTHER_CHANGES"
+  if ((PERCENT_MARGIN > MIN_MARGIN)); then
+    SAFETY_MARGIN=$PERCENT_MARGIN
+  else
+    SAFETY_MARGIN=$MIN_MARGIN
+  fi
 fi
 
+REQUIRED_BYTES=$((TRANSFER_BYTES + SAFETY_MARGIN))
+
 echo
-echo "  Source:      $SOURCE"
-echo "  Destination: $TARGET"
-echo
-echo "Detailed changes:"
-echo "  $DETAILS_FILE"
-echo
+echo "Planned synchronization"
+printf '  Changes          : %s\n' "$CHANGE_COUNT"
+printf '  Deletions        : %s\n' "$DELETE_COUNT"
+printf '  Data to transfer : %s\n' \
+  "$(numfmt --to=iec-i --suffix=B "$TRANSFER_BYTES")"
+printf '  Safety margin    : %s\n' \
+  "$(numfmt --to=iec-i --suffix=B "$SAFETY_MARGIN")"
+printf '  Required space   : %s\n' \
+  "$(numfmt --to=iec-i --suffix=B "$REQUIRED_BYTES")"
+printf '  Available space  : %s\n' \
+  "$(numfmt --to=iec-i --suffix=B "$AVAILABLE_BYTES")"
+printf '  Source           : %s\n' "$SOURCE"
+printf '  Destination      : %s\n' "$TARGET"
 
 if $DELETE; then
-  read -r -p \
-    "Continue and mirror the source, including deletions? [y/N] " \
-    APPLY_ANSWER
-else
-  read -r -p \
-    "Continue with synchronization? [y/N] " \
-    APPLY_ANSWER
+  printf '  Trash            : %s/\n' "$TRASH_RUN_DIR"
 fi
 
-case "$APPLY_ANSWER" in
-  y|Y|yes|YES)
-    if $DELETE; then
-      RSYNC_OPTIONS+=(--delete-delay)
-    fi
-    ;;
-  *)
-    echo "Synchronization cancelled."
-    echo "Details kept at: $DETAILS_FILE"
+printf '  Full report      : %s\n' "$REPORT_FILE"
+
+if ((AVAILABLE_BYTES < REQUIRED_BYTES)); then
+  KEEP_REPORT=true
+  echo
+  echo "Insufficient space. Synchronization has not started." >&2
+  echo "Report kept at: $REPORT_FILE" >&2
+  exit 1
+fi
+
+if $DELETE && ((DELETE_COUNT > 0)); then
+  echo
+  printf 'Type "DELETE %s" to confirm: ' "$DELETE_COUNT"
+  read -r ANSWER
+  [[ "$ANSWER" == "DELETE $DELETE_COUNT" ]] || {
+    KEEP_REPORT=true
+    echo "Synchronization cancelled. Report kept at: $REPORT_FILE"
     exit 0
-    ;;
-esac
+  }
+else
+  echo
+  read -r -p "Continue with synchronization? [y/N] " ANSWER
+  case "$ANSWER" in
+    y|Y|yes|YES) ;;
+    *)
+      KEEP_REPORT=true
+      echo "Synchronization cancelled. Report kept at: $REPORT_FILE"
+      exit 0
+      ;;
+  esac
+fi
+
+RSYNC_OPTIONS=(
+  "${COMMON_OPTIONS[@]}"
+  --human-readable
+  --info=progress2
+)
+
+if $DELETE; then
+  mkdir -p "$TRASH_RUN_DIR"
+
+  RSYNC_OPTIONS+=(
+    --delete-delay
+    --max-delete="$DELETE_COUNT"
+    --backup
+    --backup-dir="$TRASH_RUN_DIR"
+  )
+fi
+
+KEEP_REPORT=true
 
 echo
-rsync "${RSYNC_OPTIONS[@]}" "$SOURCE" "$TARGET"
+if ! rsync "${RSYNC_OPTIONS[@]}" "$SOURCE" "$TARGET"; then
+  echo "Synchronization failed. Report kept at: $REPORT_FILE" >&2
+  exit 1
+fi
 
-sync
-rm -f "$DETAILS_FILE"
+if ! sync; then
+  echo "Filesystem flush failed. Report kept at: $REPORT_FILE" >&2
+  exit 1
+fi
+
+KEEP_REPORT=false
+
+if $DELETE && [[ -d "$TRASH_RUN_DIR" ]] &&
+   [[ -z "$(find "$TRASH_RUN_DIR" -mindepth 1 -print -quit)" ]]; then
+  rmdir "$TRASH_RUN_DIR"
+fi
 
 echo
 echo "Backup completed successfully."
+if $DELETE && [[ -d "$TRASH_RUN_DIR" ]]; then
+  echo "Deleted or replaced files retained in: $TRASH_RUN_DIR"
+fi

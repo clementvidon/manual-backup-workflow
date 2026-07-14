@@ -87,6 +87,7 @@ CLOUD_ARCHIVES_DIR="$HOME/pCloudDrive/Archives"
 HARD_DRIVE_LUKS_UUID="52936657-45cb-4718-b305-19698ca1cbf7"
 HARD_DRIVE_MAPPER="backup"
 HARD_DRIVE_MOUNT_POINT="/mnt/backup"
+HARD_DRIVE_TRASH_DIR="Trash"
 
 mkdir -p "$BACKUP_STAGING_DIR"
 mkdir -p "$LOCAL_BACKUPS_DIR"
@@ -321,6 +322,7 @@ sync-luks-backup \
   --luks-uuid "$HARD_DRIVE_LUKS_UUID" \
   --mapper "$HARD_DRIVE_MAPPER" \
   --mount-point "$HARD_DRIVE_MOUNT_POINT" \
+  --trash-dir "$HARD_DRIVE_TRASH_DIR/" \
   --delete
 ```
 
