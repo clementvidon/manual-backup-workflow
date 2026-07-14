@@ -84,6 +84,10 @@ BACKUP_OUTPUT_DIR="$HOME/Desktop/Ready-to-upload"
 CLOUD_NAME="pCloud"
 CLOUD_ARCHIVES_DIR="$HOME/pCloudDrive/Archives"
 
+HARD_DRIVE_LUKS_UUID="52936657-45cb-4718-b305-19698ca1cbf7"
+HARD_DRIVE_MAPPER="backup"
+HARD_DRIVE_MOUNT_POINT="/mnt/backup"
+
 mkdir -p "$BACKUP_STAGING_DIR"
 mkdir -p "$LOCAL_BACKUPS_DIR"
 mkdir -p "$BACKUP_OUTPUT_DIR"
@@ -314,9 +318,9 @@ Backups under `~/Desktop/Backups` are retained as an encrypted local copy.
 sync-luks-backup \
   --source "$CLOUD_ARCHIVES_DIR/" \
   --destination "$CLOUD_NAME/Archives/" \
-  --luks-uuid "52936657-45cb-4718-b305-19698ca1cbf7" \
-  --mapper "backup" \
-  --mount-point "/mnt/backup" \
+  --luks-uuid "$HARD_DRIVE_LUKS_UUID" \
+  --mapper "$HARD_DRIVE_MAPPER" \
+  --mount-point "$HARD_DRIVE_MOUNT_POINT" \
   --delete
 ```
 
