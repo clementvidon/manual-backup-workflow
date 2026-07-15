@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""
+tidy-trash
+
+Companion utility for the sync-luks-backup workflow.
+
+sync-luks-backup preserves deleted and replaced destination files inside
+Trash/<timestamp>/ instead of destroying them. tidy-trash finds files in Trash
+that still exist somewhere in the current Archives tree with:
+
+  1. the same filename;
+  2. the same exact byte size;
+  3. the same full BLAKE2b checksum.
+
+The workflow has two explicit commands:
+
+  tidy-trash plan ...
+      Scan Archives and Trash, verify matches, and write a reusable JSON plan.
+      Nothing is moved or deleted.
+
+  tidy-trash apply ...
+      Read an existing plan and move its verified Trash copies into
+      Trash/Safe-to-delete/<timestamp>/ without recalculating checksums.
+
+Safety properties:
+
+- Archives is never modified.
+- Nothing outside Trash is moved or deleted.
+- Symbolic links are ignored and rejected.
+- Plan files are written atomically.
+- Apply rechecks paths and exact sizes, but trusts the checksums stored in
+  the plan instead of recalculating them.
+- Files are never deleted directly; they are moved into Safe-to-delete.
+- A report.txt is written beside the moved files for manual review.
+
+Usage:
+
+  Plan:
+    tidy-trash plan \
+      --trash-root "/media/clem/BACKUP/Trash" \
+      --archives "/media/clem/BACKUP/pCloud/Archives" \
+      --plan "/tmp/tidy-trash-plan.json"
+
+  Apply:
+    tidy-trash apply \
+      --plan "/tmp/tidy-trash-plan.json"
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import tempfile
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterator
+
+SAFE_DIR_NAME = "Safe-to-delete"
+HASH_ALGORITHM = "blake2b-256"
+HASH_CHUNK_SIZE = 8 * 1024 * 1024
+PLAN_VERSION = 1
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def human_size(size: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    value = float(size)
+
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+
+    return f"{size} B"
+
+
+def is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_directory(path: Path, label: str) -> Path:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except OSError as exc:
+        fail(f"cannot resolve {label}: {exc}")
+
+    if not resolved.is_dir():
+        fail(f"{label} is not a directory: {resolved}")
+    if resolved == Path("/"):
+        fail(f"{label} must not be /")
+
+    return resolved
+
+
+def iter_regular_files(
+    root: Path,
+    excluded_root: Path | None = None,
+) -> Iterator[Path]:
+    """Yield regular files recursively without following symbolic links."""
+    stack = [root]
+
+    while stack:
+        directory = stack.pop()
+
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+
+                    if excluded_root is not None and (
+                        path == excluded_root or is_within(path, excluded_root)
+                    ):
+                        continue
+
+                    if entry.is_symlink():
+                        continue
+
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(path)
+                    elif entry.is_file(follow_symlinks=False):
+                        yield path
+        except OSError as exc:
+            fail(f"cannot read {directory}: {exc}")
+
+
+def file_hash(path: Path) -> str:
+    digest = hashlib.blake2b(digest_size=32)
+
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(HASH_CHUNK_SIZE):
+                digest.update(chunk)
+    except OSError as exc:
+        fail(f"cannot hash {path}: {exc}")
+
+    return digest.hexdigest()
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path = path.expanduser().resolve(strict=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.exists():
+        fail(f"plan already exists: {path}")
+
+    temp_path: Path | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        os.replace(temp_path, path)
+    except Exception:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
+
+
+def load_plan(path: Path) -> tuple[Path, dict[str, Any]]:
+    try:
+        plan_path = path.expanduser().resolve(strict=True)
+        with plan_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"cannot read plan: {exc}")
+
+    if not isinstance(payload, dict):
+        fail("invalid plan: root must be an object")
+    if payload.get("version") != PLAN_VERSION:
+        fail(f"unsupported plan version: {payload.get('version')!r}")
+    if payload.get("hash_algorithm") != HASH_ALGORITHM:
+        fail(f"unsupported hash algorithm: {payload.get('hash_algorithm')!r}")
+    if not isinstance(payload.get("matches"), list):
+        fail("invalid plan: matches must be a list")
+
+    return plan_path, payload
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    trash_root = resolve_directory(args.trash_root, "Trash root")
+    archives = resolve_directory(args.archives, "Archives")
+
+    if is_within(archives, trash_root) or is_within(trash_root, archives):
+        fail("Trash and Archives must be separate directory trees")
+
+    safe_root = (trash_root / SAFE_DIR_NAME).resolve(strict=False)
+    if not is_within(safe_root, trash_root):
+        fail("Safe-to-delete would escape Trash")
+
+    archive_index: dict[tuple[str, int], list[Path]] = defaultdict(list)
+
+    print("Indexing Archives by filename and exact byte size...")
+
+    archive_count = 0
+    for archive_file in iter_regular_files(archives):
+        try:
+            size = archive_file.stat(follow_symlinks=False).st_size
+        except OSError as exc:
+            fail(f"cannot stat {archive_file}: {exc}")
+
+        archive_index[(archive_file.name, size)].append(archive_file)
+        archive_count += 1
+
+    print(f"Indexed {archive_count} archive files.")
+    print("Scanning Trash for same-name and same-size candidates...")
+
+    candidates: list[tuple[Path, list[Path], int]] = []
+    trash_count = 0
+
+    for trash_file in iter_regular_files(trash_root, excluded_root=safe_root):
+        trash_count += 1
+
+        try:
+            trash_size = trash_file.stat(follow_symlinks=False).st_size
+        except OSError as exc:
+            fail(f"cannot stat {trash_file}: {exc}")
+
+        archive_candidates = archive_index.get((trash_file.name, trash_size))
+        if archive_candidates:
+            candidates.append((trash_file, archive_candidates, trash_size))
+
+    print(f"Scanned {trash_count} Trash files.")
+    print(f"Found {len(candidates)} name-and-size candidates.")
+    print("Verifying candidates by full checksum...")
+
+    matches: list[dict[str, Any]] = []
+    total_candidates = len(candidates)
+
+    for index, (trash_file, archive_candidates, trash_size) in enumerate(
+        candidates,
+        start=1,
+    ):
+        print(
+            f"\rChecking {index}/{total_candidates}: "
+            f"{trash_file.name} [{human_size(trash_size)}]",
+            end="",
+            flush=True,
+        )
+
+        trash_digest = file_hash(trash_file)
+
+        for archive_file in archive_candidates:
+            try:
+                archive_size = archive_file.stat(follow_symlinks=False).st_size
+            except OSError as exc:
+                fail(f"cannot stat {archive_file}: {exc}")
+
+            if archive_size != trash_size:
+                continue
+
+            if file_hash(archive_file) == trash_digest:
+                print("\r" + " " * 120 + "\r", end="")
+                print(
+                    f"{trash_file} exists in {archive_file} "
+                    f"[{human_size(trash_size)}]"
+                )
+
+                matches.append(
+                    {
+                        "trash": str(trash_file),
+                        "archive": str(archive_file),
+                        "size": trash_size,
+                        "checksum": trash_digest,
+                    }
+                )
+                break
+
+    if total_candidates:
+        print("\r" + " " * 120 + "\r", end="", flush=True)
+
+    plan_path = args.plan.expanduser().resolve(strict=False)
+
+    payload = {
+        "version": PLAN_VERSION,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "hash_algorithm": HASH_ALGORITHM,
+        "trash_root": str(trash_root),
+        "archives": str(archives),
+        "archive_files_indexed": archive_count,
+        "trash_files_scanned": trash_count,
+        "name_size_candidates": total_candidates,
+        "matches": matches,
+    }
+
+    atomic_write_json(plan_path, payload)
+
+    print()
+    print("Plan completed.")
+    print(f"  Archive files indexed    : {archive_count}")
+    print(f"  Trash files scanned      : {trash_count}")
+    print(f"  Name and size candidates : {total_candidates}")
+    print(f"  Full checksum matches    : {len(matches)}")
+    print(f"  Plan                     : {plan_path}")
+    print()
+    print("Nothing has been moved or deleted.")
+
+    if not matches:
+        return 0
+
+    answer = input(
+        f'Type "MOVE {len(matches)}" to apply this plan now, '
+        "or press Enter to stop: "
+    )
+
+    if answer != f"MOVE {len(matches)}":
+        print("Stopped after planning. Apply later with:")
+        print(f'  tidy-trash apply --plan "{plan_path}"')
+        return 0
+
+    return apply_payload(plan_path, payload)
+
+
+def apply_payload(
+    plan_path: Path,
+    plan: dict[str, Any],
+) -> int:
+    """Apply an already loaded plan without recalculating checksums."""
+    try:
+        trash_root = Path(plan["trash_root"]).resolve(strict=True)
+        archives = Path(plan["archives"]).resolve(strict=True)
+    except (KeyError, OSError) as exc:
+        fail(f"invalid plan roots: {exc}")
+
+    if not trash_root.is_dir() or not archives.is_dir():
+        fail("Trash or Archives root from the plan is unavailable")
+    if is_within(archives, trash_root) or is_within(trash_root, archives):
+        fail("Trash and Archives from the plan overlap")
+
+    safe_root = (trash_root / SAFE_DIR_NAME).resolve(strict=False)
+    if not is_within(safe_root, trash_root):
+        fail("Safe-to-delete would escape Trash")
+
+    matches = plan["matches"]
+
+    if not matches:
+        print("Plan contains no matches. Nothing to apply.")
+        return 0
+
+    validated: list[tuple[Path, Path, int, str]] = []
+
+    for entry in matches:
+        validated.append(
+            validate_match_entry(entry, trash_root, archives, safe_root)
+        )
+
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    review_root = safe_root / run_id
+    review_root_resolved = review_root.resolve(strict=False)
+
+    if not is_within(review_root_resolved, trash_root):
+        fail("review directory would escape Trash")
+    if review_root.exists():
+        fail(f"review directory already exists: {review_root}")
+
+    review_root.mkdir(parents=True, exist_ok=False)
+    report_path = review_root / "report.txt"
+    moved = 0
+
+    try:
+        with report_path.open("x", encoding="utf-8") as report:
+            report.write(f"Created: {datetime.now().astimezone().isoformat()}\n")
+            report.write(f"Plan: {plan_path}\n")
+            report.write(f"Archives: {archives}\n")
+            report.write(f"Trash: {trash_root}\n")
+            report.write(f"Safe to delete: {review_root}\n")
+            report.write(
+                "Plan verification: same filename, exact byte size, "
+                "full BLAKE2b checksum\n"
+            )
+            report.write(
+                "Apply verification: paths and exact byte sizes only; "
+                "plan checksums trusted\n\n"
+            )
+
+            for trash_file, archive_file, size, _checksum in validated:
+                relative_path = trash_file.relative_to(trash_root)
+                destination = review_root / relative_path
+                destination_real = destination.resolve(strict=False)
+
+                if not is_within(destination_real, review_root_resolved):
+                    fail(f"destination escaped Safe-to-delete: {destination_real}")
+                if destination.exists():
+                    fail(f"destination already exists: {destination}")
+
+                destination.parent.mkdir(parents=True, exist_ok=True)
+
+                line = (
+                    f"{trash_file} exists in {archive_file} "
+                    f"[{human_size(size)}] -> moved to {SAFE_DIR_NAME}\n"
+                )
+
+                print(line, end="")
+                report.write(line)
+                report.flush()
+
+                os.rename(trash_file, destination)
+                moved += 1
+
+    except Exception:
+        print(
+            f"\nStopped after moving {moved} file(s). "
+            f"Review the partial result in: {review_root}",
+            file=sys.stderr,
+        )
+        raise
+
+    print()
+    print(f"Moved {moved} verified file(s) to:")
+    print(f"  {review_root}")
+    print("Report:")
+    print(f"  {report_path}")
+    print()
+    print("Review this directory, then delete it manually when satisfied.")
+    return 0
+
+
+def validate_match_entry(
+    entry: Any,
+    trash_root: Path,
+    archives: Path,
+    safe_root: Path,
+) -> tuple[Path, Path, int, str]:
+    """Validate planned paths and sizes without recalculating checksums."""
+    if not isinstance(entry, dict):
+        fail("invalid plan entry")
+
+    trash_value = entry.get("trash")
+    archive_value = entry.get("archive")
+    size = entry.get("size")
+    checksum = entry.get("checksum")
+
+    if not isinstance(trash_value, str) or not isinstance(archive_value, str):
+        fail("invalid plan entry paths")
+    if not isinstance(size, int) or size < 0:
+        fail("invalid plan entry size")
+    if not isinstance(checksum, str) or len(checksum) != 64:
+        fail("invalid plan entry checksum")
+
+    try:
+        trash_file = Path(trash_value).resolve(strict=True)
+        archive_file = Path(archive_value).resolve(strict=True)
+    except OSError as exc:
+        fail(f"planned file is unavailable: {exc}")
+
+    if not is_within(trash_file, trash_root):
+        fail(f"planned Trash file escapes Trash: {trash_file}")
+    if is_within(trash_file, safe_root):
+        fail(f"planned file is already in Safe-to-delete: {trash_file}")
+    if not is_within(archive_file, archives):
+        fail(f"planned Archive file escapes Archives: {archive_file}")
+
+    if trash_file.is_symlink() or not trash_file.is_file():
+        fail(f"planned Trash file is not a regular file: {trash_file}")
+    if archive_file.is_symlink() or not archive_file.is_file():
+        fail(f"planned Archive file is not a regular file: {archive_file}")
+
+    trash_size = trash_file.stat(follow_symlinks=False).st_size
+    archive_size = archive_file.stat(follow_symlinks=False).st_size
+
+    if trash_size != size:
+        fail(f"Trash file size changed since plan: {trash_file}")
+    if archive_size != size:
+        fail(f"Archive file size changed since plan: {archive_file}")
+
+    return trash_file, archive_file, size, checksum
+
+
+def command_apply(args: argparse.Namespace) -> int:
+    plan_path, plan = load_plan(args.plan)
+
+    print(f"Loaded plan: {plan_path}")
+    print(f"Planned files to move: {len(plan['matches'])}")
+    print("Checksums are trusted from the plan and will not be recalculated.")
+    print()
+
+    count = len(plan["matches"])
+    if count == 0:
+        print("Plan contains no matches. Nothing to apply.")
+        return 0
+
+    answer = input(
+        f'Type "MOVE {count}" to move them into {SAFE_DIR_NAME}: '
+    )
+
+    if answer != f"MOVE {count}":
+        print("Apply cancelled. Nothing was moved.")
+        return 0
+
+    return apply_payload(plan_path, plan)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="tidy-trash",
+        usage=argparse.SUPPRESS,
+        description=(
+            "Companion utility for sync-luks-backup.\n\n"
+            "Use 'plan' to scan, checksum, save a reusable plan, and "
+            "optionally apply it immediately. Use 'apply' to trust and apply "
+            "an existing plan without recalculating checksums."
+        ),
+        epilog=(
+            "Plan:\n"
+            "  tidy-trash plan \\\n"
+            '    --trash-root "/media/clem/BACKUP/Trash" \\\n'
+            '    --archives "/media/clem/BACKUP/pCloud/Archives" \\\n'
+            '    --plan "/tmp/tidy-trash-plan.json"\n\n'
+            "Apply:\n"
+            "  tidy-trash apply \\\n"
+            '    --plan "/tmp/tidy-trash-plan.json"'
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    plan_parser = subparsers.add_parser(
+        "plan",
+        help="Scan, checksum, and create a reusable plan.",
+    )
+    plan_parser.add_argument("--trash-root", required=True, type=Path)
+    plan_parser.add_argument("--archives", required=True, type=Path)
+    plan_parser.add_argument("--plan", required=True, type=Path)
+    plan_parser.set_defaults(handler=command_plan)
+
+    apply_parser = subparsers.add_parser(
+        "apply",
+        help="Apply an existing plan without recalculating checksums.",
+    )
+    apply_parser.add_argument("--plan", required=True, type=Path)
+    apply_parser.set_defaults(handler=command_apply)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return 2
+
+    args = parser.parse_args()
+
+    if not hasattr(args, "handler"):
+        parser.print_help()
+        return 2
+
+    return args.handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
