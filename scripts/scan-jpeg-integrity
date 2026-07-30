@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""
+scan-jpeg-integrity
+
+Recursively verify JPEG files with jpeginfo, using an append-only JSONL report
+that allows an interrupted scan to resume later.
+
+Each completed file is written immediately to the report. When the command is
+run again with the same report and target, files whose size and modification
+time are unchanged are skipped automatically. Changed files are checked again.
+
+The script never modifies the scanned files.
+
+Usage:
+  scan-jpeg-integrity \
+    --report "$HOME/jpeg-integrity-backup.jsonl" \
+    --target "/media/clem/BACKUP"
+
+Resume:
+  Run the exact same command again.
+
+Read detected problems:
+  scan-jpeg-integrity \
+    --report "$HOME/jpeg-integrity-backup.jsonl" \
+    --target "/media/clem/BACKUP" \
+    --problems-only
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterator
+
+REPORT_VERSION = 1
+JPEG_SUFFIXES = {".jpg", ".jpeg"}
+PROBLEM_WORDS = (
+    "warning",
+    "error",
+    "premature",
+    "corrupt",
+    "invalid",
+    "extraneous",
+    "truncated",
+)
+SYSTEM_TRASH_NAMES = {
+    ".Trashes",
+    ".rsync-partial",
+}
+
+
+def should_skip_directory(path: Path, root: Path) -> bool:
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return True
+
+    for part in parts:
+        if part.startswith(".Trash-"):
+            return True
+
+        if part in SYSTEM_TRASH_NAMES:
+            return True
+
+    for index in range(len(parts) - 1):
+        if parts[index] == "Trash" and parts[index + 1] == "Safe-to-delete":
+            return True
+
+    return False
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat()
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="scan-jpeg-integrity",
+        usage=argparse.SUPPRESS,
+        description=(
+            "Recursively check JPEG files with jpeginfo. Progress is stored in "
+            "an append-only JSONL report, so an interrupted scan resumes "
+            "automatically when the same command is run again."
+        ),
+        epilog=(
+            "Start or resume a scan:\n"
+            "  scan-jpeg-integrity \\\n"
+            '    --report "$HOME/jpeg-integrity-backup.jsonl" \\\n'
+            '    --target "/media/clem/BACKUP"\n\n'
+            "Display only known problems without scanning:\n"
+            "  scan-jpeg-integrity \\\n"
+            '    --report "$HOME/jpeg-integrity-backup.jsonl" \\\n'
+            '    --target "/media/clem/BACKUP" \\\n'
+            "    --problems-only"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--report",
+        required=True,
+        type=Path,
+        help="Append-only JSONL report used for progress and resume.",
+    )
+    parser.add_argument(
+        "--target",
+        required=True,
+        type=Path,
+        help="Directory to scan recursively.",
+    )
+    parser.add_argument(
+        "--problems-only",
+        action="store_true",
+        help="Print known problems from the report without scanning.",
+    )
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        raise SystemExit(2)
+
+    return parser.parse_args()
+
+
+def iter_jpegs(root: Path) -> Iterator[Path]:
+    """Yield regular JPEG files recursively without following symlinks."""
+    stack = [root]
+
+    while stack:
+        directory = stack.pop()
+
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+
+                    if entry.is_symlink():
+                        continue
+
+                    if entry.is_dir(follow_symlinks=False):
+                        if should_skip_directory(path, root):
+                            continue
+
+                        stack.append(path)
+                    elif (
+                        entry.is_file(follow_symlinks=False)
+                        and path.suffix.lower() in JPEG_SUFFIXES
+                    ):
+                        yield path
+        except OSError as exc:
+            fail(f"cannot read directory {directory}: {exc}")
+
+
+def append_record(handle, record: dict[str, Any]) -> None:
+    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def load_report(
+    report_path: Path,
+) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]]]:
+    header: dict[str, Any] | None = None
+    latest: dict[str, dict[str, Any]] = {}
+
+    if not report_path.exists():
+        return header, latest
+
+    try:
+        with report_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.rstrip("\n")
+
+                if not line:
+                    continue
+
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    # A final partial line can remain after a power loss.
+                    print(
+                        f"Warning: ignoring incomplete report line {line_number}.",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                if not isinstance(record, dict):
+                    continue
+
+                if record.get("type") == "header":
+                    if header is None:
+                        header = record
+                elif record.get("type") == "file":
+                    relative_path = record.get("path")
+                    if isinstance(relative_path, str):
+                        latest[relative_path] = record
+    except OSError as exc:
+        fail(f"cannot read report {report_path}: {exc}")
+
+    return header, latest
+
+
+def is_problem(return_code: int, output: str) -> bool:
+    lowered = output.lower()
+    return return_code != 0 or any(word in lowered for word in PROBLEM_WORDS)
+
+
+def check_file(path: Path) -> tuple[int, str, bool]:
+    try:
+        completed = subprocess.run(
+            ["jpeginfo", "-c", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        return 127, str(exc), True
+
+    output = completed.stdout.strip()
+    return completed.returncode, output, is_problem(completed.returncode, output)
+
+
+def record_is_current(
+    target: Path,
+    record: dict[str, Any],
+) -> bool:
+    relative_path = record.get("path")
+
+    if not isinstance(relative_path, str):
+        return False
+
+    path = target / relative_path
+
+    try:
+        if path.is_symlink():
+            return False
+
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(target)
+        stat = resolved.stat(follow_symlinks=False)
+    except (OSError, ValueError):
+        return False
+
+    if should_skip_directory(resolved.parent, target):
+        return False
+
+    return (
+        stat.st_size == record.get("size")
+        and stat.st_mtime_ns == record.get("mtime_ns")
+    )
+
+
+def print_known_problems(
+    target: Path,
+    records: dict[str, dict[str, Any]],
+) -> int:
+    problems = [
+        record
+        for record in records.values()
+        if record.get("problem") is True
+        and record_is_current(target, record)
+    ]
+
+    for record in sorted(problems, key=lambda item: str(item.get("path", ""))):
+        path = target / str(record.get("path", ""))
+        output = str(record.get("output", "")).strip()
+        print(f"{path}")
+        if output:
+            print(f"  {output}")
+
+    print()
+    print(f"Known problematic JPEG files: {len(problems)}")
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+
+    if shutil.which("jpeginfo") is None:
+        fail("jpeginfo is not installed. Install it with: sudo apt install jpeginfo")
+
+    try:
+        target = args.target.expanduser().resolve(strict=True)
+    except OSError as exc:
+        fail(f"cannot resolve target: {exc}")
+
+    if not target.is_dir():
+        fail(f"target is not a directory: {target}")
+    if target == Path("/"):
+        fail("refusing to scan /")
+
+    report_path = args.report.expanduser().resolve(strict=False)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    header, records = load_report(report_path)
+
+    if header is not None:
+        if header.get("version") != REPORT_VERSION:
+            fail(f"unsupported report version: {header.get('version')!r}")
+
+        recorded_target = header.get("target")
+        if recorded_target != str(target):
+            fail(
+                "report belongs to another target:\n"
+                f"  Report target: {recorded_target}\n"
+                f"  Requested:     {target}"
+            )
+
+        recorded_checker = header.get("checker")
+        expected_checker = "jpeginfo -c"
+
+        if recorded_checker != expected_checker:
+            fail(
+                "report was created by another checker:\n"
+                f"  Report checker: {recorded_checker}\n"
+                f"  Expected:       {expected_checker}"
+            )
+
+    if args.problems_only:
+        return print_known_problems(target, records)
+
+    mode = "a" if report_path.exists() else "x"
+
+    print("Indexing JPEG paths...")
+    jpeg_files = list(iter_jpegs(target))
+    total_files = len(jpeg_files)
+
+    checked_now = 0
+    skipped = 0
+    problems_now = 0
+    known_problems = sum(
+        1
+        for record in records.values()
+        if record.get("problem") is True
+        and record_is_current(target, record)
+    )
+
+    try:
+        with report_path.open(mode, encoding="utf-8") as report:
+            if header is None:
+                append_record(
+                    report,
+                    {
+                        "type": "header",
+                        "version": REPORT_VERSION,
+                        "created_at": now_iso(),
+                        "target": str(target),
+                        "checker": "jpeginfo -c",
+                    },
+                )
+
+            print(f"Target : {target}")
+            print(f"Report : {report_path}")
+            print("Scanning JPEG files. Press Ctrl+C to stop safely.")
+            print()
+
+            for jpeg_path in jpeg_files:
+                try:
+                    stat = jpeg_path.stat(follow_symlinks=False)
+                    relative_path = str(jpeg_path.relative_to(target))
+                except OSError as exc:
+                    print(f"\nWarning: cannot stat {jpeg_path}: {exc}", file=sys.stderr)
+                    continue
+
+                previous = records.get(relative_path)
+
+                if (
+                    previous is not None
+                    and previous.get("size") == stat.st_size
+                    and previous.get("mtime_ns") == stat.st_mtime_ns
+                ):
+                    skipped += 1
+                    processed = checked_now + skipped
+                    print(
+                        f"\rChecked {processed}/{total_files} | "
+                        f"Problems {known_problems} | "
+                        f"New {checked_now} | Resumed {skipped} | "
+                        f"{relative_path}",
+                        end="",
+                        flush=True,
+                    )
+                    continue
+
+                checked_now += 1
+                processed = checked_now + skipped
+                print(
+                    f"\rChecked {processed}/{total_files} | "
+                    f"Problems {known_problems} | "
+                    f"New {checked_now} | Resumed {skipped} | "
+                    f"{relative_path}",
+                    end="",
+                    flush=True,
+                )
+
+                return_code, output, problem = check_file(jpeg_path)
+
+                record = {
+                    "type": "file",
+                    "checked_at": now_iso(),
+                    "path": relative_path,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "return_code": return_code,
+                    "problem": problem,
+                    "output": output,
+                }
+
+                previous_problem = (
+                    previous is not None
+                    and previous.get("problem") is True
+                    and record_is_current(target, previous)
+                )
+
+                append_record(report, record)
+                records[relative_path] = record
+
+                if previous_problem and not problem:
+                    known_problems -= 1
+                elif not previous_problem and problem:
+                    known_problems += 1
+
+                if problem:
+                    problems_now += 1
+                    print("\r" + " " * 180 + "\r", end="")
+                    print(f"PROBLEM: {jpeg_path}")
+                    if output:
+                        print(f"  {output}")
+
+    except KeyboardInterrupt:
+        print("\r" + " " * 180 + "\r", end="")
+        print("Scan interrupted safely.")
+        print(f"Resume with the same command. Report: {report_path}")
+        return 130
+
+    print("\r" + " " * 180 + "\r", end="")
+    total_problems = known_problems
+
+    print("Scan completed.")
+    print(f"  Total JPEG files   : {total_files}")
+    print(f"  Checked now        : {checked_now}")
+    print(f"  Skipped from report: {skipped}")
+    print(f"  Problems found now : {problems_now}")
+    print(f"  Known problems     : {total_problems}")
+    print(f"  Report             : {report_path}")
+    print()
+    print("Display known problems with:")
+    print(
+        f'  scan-jpeg-integrity --report "{report_path}" '
+        f'--target "{target}" --problems-only'
+    )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  unmount-luks-backup \
+    [--mapper <name>] \
+    [--mount-point <directory>]
+USAGE
+}
+
+MAPPER="backup"
+MOUNT_POINT="/media/$USER/BACKUP"
+
+while (($#)); do
+  case "$1" in
+    --mapper)
+      MAPPER="${2:?Missing value for --mapper}"
+      shift 2
+      ;;
+    --mount-point)
+      MOUNT_POINT="${2:?Missing value for --mount-point}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+for command in \
+  cryptsetup \
+  findmnt \
+  fuser \
+  mountpoint \
+  sudo \
+  umount; do
+  command -v "$command" >/dev/null 2>&1 || {
+    echo "Required command not found: $command" >&2
+    exit 1
+  }
+done
+
+[[ "$MAPPER" =~ ^[A-Za-z0-9._+-]+$ ]] || {
+  echo "Invalid mapper name: $MAPPER" >&2
+  exit 2
+}
+
+[[ "$MOUNT_POINT" == /* && "$MOUNT_POINT" != "/" ]] || {
+  echo "Mount point must be an absolute path other than /." >&2
+  exit 2
+}
+
+MOUNT_POINT="${MOUNT_POINT%/}"
+MAPPED_DEVICE="/dev/mapper/$MAPPER"
+
+if mountpoint -q "$MOUNT_POINT"; then
+  echo "Unmounting $MOUNT_POINT..."
+
+  if ! sudo umount "$MOUNT_POINT"; then
+    echo >&2
+    echo "Unable to unmount. Processes still using the filesystem:" >&2
+    sudo fuser -vm "$MOUNT_POINT" >&2 || true
+    echo >&2
+    echo "Leave every shell or tmux pane whose current directory is on the HDD," >&2
+    echo "close file managers using it, then retry." >&2
+    exit 1
+  fi
+elif findmnt -rn -S "$MAPPED_DEVICE" >/dev/null 2>&1; then
+  actual_mount="$(
+    findmnt -rn -S "$MAPPED_DEVICE" -o TARGET |
+      head -n 1
+  )"
+
+  echo "Mapper is mounted somewhere else: $actual_mount" >&2
+  echo "Rerun with:" >&2
+  echo "  unmount-luks-backup --mapper \"$MAPPER\" --mount-point \"$actual_mount\"" >&2
+  exit 1
+else
+  echo "Mount point is not mounted: $MOUNT_POINT"
+fi
+
+if sudo cryptsetup status "$MAPPER" >/dev/null 2>&1; then
+  echo "Closing LUKS mapper $MAPPER..."
+
+  if ! sudo cryptsetup close "$MAPPER"; then
+    echo >&2
+    echo "Unable to close mapper. Processes still using it:" >&2
+    sudo fuser -vm "$MAPPED_DEVICE" >&2 || true
+    echo >&2
+    echo "A shell or tmux pane may still have its current directory on the HDD." >&2
+    exit 1
+  fi
+else
+  echo "Mapper is already inactive: $MAPPER"
+fi
+
+echo
+echo "Backup HDD unmounted and closed."

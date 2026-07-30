@@ -459,9 +459,18 @@ def validate_match_entry(
     if not isinstance(checksum, str) or len(checksum) != 64:
         fail("invalid plan entry checksum")
 
+    trash_path = Path(trash_value)
+    archive_path = Path(archive_value)
+
     try:
-        trash_file = Path(trash_value).resolve(strict=True)
-        archive_file = Path(archive_value).resolve(strict=True)
+        if trash_path.is_symlink():
+            fail(f"planned Trash path is a symbolic link: {trash_path}")
+
+        if archive_path.is_symlink():
+            fail(f"planned Archive path is a symbolic link: {archive_path}")
+
+        trash_file = trash_path.resolve(strict=True)
+        archive_file = archive_path.resolve(strict=True)
     except OSError as exc:
         fail(f"planned file is unavailable: {exc}")
 
@@ -472,9 +481,10 @@ def validate_match_entry(
     if not is_within(archive_file, archives):
         fail(f"planned Archive file escapes Archives: {archive_file}")
 
-    if trash_file.is_symlink() or not trash_file.is_file():
+    if not trash_file.is_file():
         fail(f"planned Trash file is not a regular file: {trash_file}")
-    if archive_file.is_symlink() or not archive_file.is_file():
+
+    if not archive_file.is_file():
         fail(f"planned Archive file is not a regular file: {archive_file}")
 
     trash_size = trash_file.stat(follow_symlinks=False).st_size

@@ -1,23 +1,29 @@
-# Manual Backup Workflow
+# Personal Backup Workflow
 
-Manual Backup Workflow creates encrypted, verifiable archives for manual backup sessions.
+Personal Backup Workflow is a collection of explicit and verifiable tools for managing personal backups on GNU/Linux.
 
-It favors clarity and portability over automation: organize your filesystem, prepare machine recovery
-snapshots, create and verify encrypted archives, and prepare them for transfer to backup storage.
+It covers three related areas:
 
-It is intended for workspace and laptop backups, not for managing large long-term media archives.
-For photo/video archive organization, see [`photography-archiving-workflow`](https://github.com/clementvidon/photography-archiving-workflow).
+1. creating encrypted snapshots of personal files and machine recovery data;
+2. mirroring long-term Cloud archives to an encrypted local hard disk;
+3. checking backup integrity and storage health over time.
 
-This is not a replacement for automated incremental backup systems or rsync-based snapshot workflows.
+The workflow favors clarity, inspectability, and recoverability over unattended automation. Sensitive
+data is encrypted before upload, incomplete outputs use temporary names, and important results are
+verified before being finalized.
 
-Tested on GNU/Linux / Ubuntu for now. Only a few adjustments should be needed to make the workflow compatible with macOS.
+Photo and video archive organization itself remains outside this repository. For naming, structure,
+ingestion, and archival conventions, see
+[`photography-archiving-workflow`](https://github.com/clementvidon/photography-archiving-workflow).
+
+Tested on Ubuntu.
 
 ## Method
 
 The system is based on four ideas:
 
 1. Keep important files in known locations.
-2. Create encrypted, verified backups in a local staging directory.
+2. Create encrypted and verified backup artifacts locally before upload.
 3. Transfer completed backups manually to remote backup storage.
 4. Make each backup self-describing enough to verify and restore later.
 
@@ -27,14 +33,30 @@ Each encrypted backup includes:
 - an `INFO.md` file describing the source
 - a `SHA256SUMS.txt` file for integrity verification
 
-## Backup flow
+`SHA256SUMS.txt` is the canonical checksum filename.
+`scan-age-tar-integrity` does not recognize alternate legacy names such as
+`SHA256SUMS`; those files must be renamed or regenerated manually.
+
+## Backup flows
+
+### Encrypted snapshot flow
 
 ```text
 source
   → encrypted and verified backup
-  → local staging directory
+  → local upload directory
   → manual upload to remote storage
-  → local removal after confirming the remote transfer
+  → local removal or retention according to backup type
+```
+
+### Archive mirror flow
+
+```text
+Cloud Archives
+  → verified rsync plan
+  → encrypted local hard-disk mirror
+  → incremental integrity checks
+  → periodic full verification
 ```
 
 ## Local Filesystem Organization
@@ -61,7 +83,7 @@ These locations should be backed up:
 ~/Desktop
 ├── Works: Active GUI work and projects.
 ├── Chores: Active personal tasks.
-└── Backups: Local copies of external data sources.
+└── Backups: Durable encrypted backups of external sources and machine recovery data.
 ```
 
 `~/Documents` should stay as light as possible so it remains easy to back up.
@@ -69,6 +91,14 @@ These locations should be backed up:
 Important lightweight personal media can live in `~/Documents/Media` or `~/Documents/Memories`.
 
 Large photo or video archives should live in dedicated archive storage, not on the machine SSD.
+
+### Staging and backup locations
+
+These locations have distinct roles:
+
+- `~/Desktop/Backups-staging` temporarily contains clear-text copies collected from external sources.
+- `~/Desktop/Ready-to-upload` temporarily contains encrypted personal snapshots awaiting upload.
+- `~/Desktop/Backups` contains finalized encrypted external-source and machine-recovery backups and is retained after staging data has been removed.
 
 ### Locations outside the default backup scope
 
@@ -87,7 +117,7 @@ large replaceable files that do not need long-term backup, such as downloads, mu
 
 ## Backup Scope
 
-The default encrypted backup scope includes:
+The workflow protects the following data:
 
 ```text
 ~/Documents
@@ -96,12 +126,17 @@ The default encrypted backup scope includes:
 ~/Desktop/Backups
 ```
 
+`Documents`, `Works`, and `Chores` are encrypted as dedicated personal-file
+snapshots. The finalized backups already stored under `~/Desktop/Backups` are
+uploaded individually rather than wrapped in another aggregate archive.
+
 `~/Documents` is included entirely.
 
 Only selected Desktop directories are included. Other Desktop files are outside the default backup
 scope unless moved into `Works`, `Chores`, or `Backups`.
 
-External data sources are included after being copied into `~/Desktop/Backups`.
+External data sources are first copied into `~/Desktop/Backups-staging`, then
+encrypted into finalized backups under `~/Desktop/Backups`.
 
 Machine recovery data is generated during the workflow and added to the encrypted backup.
 
@@ -110,19 +145,55 @@ Machine recovery data is generated during the workflow and added to the encrypte
 Some data may live outside the main user filesystem: phones, e-readers, repository hosting
 platforms, external drives, or cloud services.
 
-In this workflow, these sources are first copied into `~/Desktop/Backups`, then included in the main
-encrypted backup scope.
+In this workflow, these sources are first copied into `~/Desktop/Backups-staging`,
+then converted into finalized encrypted backups under `~/Desktop/Backups`.
 
 See [`EXTERNAL-DATA-SOURCES.md`](./EXTERNAL-DATA-SOURCES.md) for source-specific workflows.
 
 ## Tools
 
-* `encrypt-this`: create and verify one encrypted `.tar.age` archive from a file or directory.
-* `create-encrypted-backup`: create and verify one encrypted backup in a local output directory.
-* `backup-user-apps`: create a local snapshot of installed apps and user-side app state.
-* `backup-machine-state`: create a local snapshot of system-level configuration such as `/etc`.
-* `clone-github`: clone all repositories from a GitHub user or organization into a dated local backup directory.
-* `sync-luks-backup`: synchronize a directory to an encrypted LUKS backup using `rsync`.
+### Encrypted snapshots
+
+* `encrypt-this`: create and immediately verify one encrypted `.tar.age` archive.
+* `create-encrypted-backup`: create a self-describing encrypted backup containing `INFO.md`, one `.tar.age` archive, and `SHA256SUMS.txt`.
+* `backup-user-apps`: capture installed-app manifests and user-side application configuration for recovery.
+* `backup-machine-state`: capture `/etc` and system-level package, service, and machine manifests.
+* `clone-github`: clone all repositories from a GitHub user or organization into a dated local snapshot.
+
+### Archive replication
+
+* `sync-luks-backup`: mirror a source directory to an encrypted LUKS hard disk with `rsync`, retaining replaced or deleted files in `Trash`.
+* `tidy-trash`: identify Trash files that still exist identically in the current archive tree and move verified duplicates into `Trash/Safe-to-delete`.
+* `mount-luks-backup`: open and mount the encrypted archive hard disk for inspection or integrity scans.
+* `unmount-luks-backup`: safely unmount the archive hard disk and close its LUKS mapper.
+
+### Integrity checking
+
+* `scan-jpeg-integrity`: verify that JPEG files decode correctly with `jpeginfo`.
+* `scan-mp4-integrity`: fully decode MP4 audio and video streams with FFmpeg.
+* `scan-nef-integrity`: fully decode Nikon NEF files through a temporary darktable TIFF export.
+* `scan-age-tar-integrity`: verify `.tar.age` archives against an adjacent `SHA256SUMS.txt`.
+
+## Verification levels
+
+The workflow uses three complementary forms of verification.
+
+### Checksum verification
+
+`scan-age-tar-integrity` compares each `.tar.age` archive against a previously recorded SHA-256
+digest. This detects any byte-level change to the encrypted archive.
+
+### Format and decode verification
+
+The JPEG, MP4, and NEF scanners verify that files can still be parsed or decoded by their respective
+tools. They detect many forms of truncation and corruption, but they do not prove that a file is
+byte-for-byte identical to an earlier version because no reference hash is stored for those files.
+
+### Disk-health verification
+
+SMART reports and self-tests inspect the physical storage device for signs of hardware degradation.
+A healthy SMART report does not prove that every file is intact, and a successful file scan does not
+prove that the disk hardware is healthy.
 
 ## Workflow
 
@@ -135,25 +206,43 @@ Machine recovery snapshots contain sensitive data. They are created temporarily 
 
 ### Install dependencies
 
-For password-based encryption:
+Core backup, encryption, archive replication, mounting, and integrity tools:
 
 ```bash
-sudo apt install age tar coreutils findutils sed
+sudo apt install \
+  age \
+  coreutils \
+  cryptsetup \
+  darktable \
+  ffmpeg \
+  findutils \
+  jpeginfo \
+  psmisc \
+  python3 \
+  rsync \
+  sed \
+  smartmontools \
+  tar \
+  util-linux
 ```
 
-For `pass` / YubiKey-based encryption:
+For age keys stored in `pass`, including YubiKey-backed GPG setups:
 
 ```bash
-sudo apt install age pass gnupg scdaemon pcscd tar coreutils findutils sed
+sudo apt install \
+  pass \
+  gnupg \
+  scdaemon \
+  pcscd
 ```
 
-Optional sound notification, used to alert when action is required to unlock the YubiKey:
+Optional sound notification when key interaction is required:
 
 ```bash
 sudo apt install pulseaudio-utils
 ```
 
-Optional GitHub external data source workflow:
+Optional GitHub external-source workflow:
 
 ```bash
 sudo apt install gh
@@ -163,8 +252,8 @@ gh auth login
 ### Install the workflow tools
 
 ```bash
-git clone https://github.com/clementvidon/manual-backup-workflow
-cd manual-backup-workflow
+git clone https://github.com/clementvidon/personal-backup-workflow
+cd personal-backup-workflow
 bash install.sh
 hash -r
 ```

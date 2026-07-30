@@ -1,4 +1,4 @@
-# Backup Workflow
+# Personal Backup Workflow
 
 This workflow backs up personal files, external data sources, and machine recovery data.
 
@@ -87,14 +87,29 @@ CLOUD_ARCHIVES_DIR="$HOME/pCloudDrive/Archives"
 HARD_DRIVE_LUKS_UUID="52936657-45cb-4718-b305-19698ca1cbf7"
 HARD_DRIVE_MAPPER="backup"
 HARD_DRIVE_MOUNT_POINT="/mnt/backup"
+HARD_DRIVE_SCAN_ROOT="/media/$USER/BACKUP"
 HARD_DRIVE_TRASH_DIR="Trash"
+INTEGRITY_REPORT_DIR="$HOME/tmp/backup-integrity"
 
 mkdir -p "$BACKUP_STAGING_DIR"
 mkdir -p "$LOCAL_BACKUPS_DIR"
 mkdir -p "$BACKUP_OUTPUT_DIR"
+mkdir -p "$INTEGRITY_REPORT_DIR"
 ```
 
 `Backups-staging/` and `Ready-to-upload/` must not be synchronized automatically to Cloud.
+
+Create the archive-root safety marker once:
+
+```bash
+touch "$CLOUD_ARCHIVES_DIR/.archive-root"
+```
+
+`sync-luks-backup` requires this marker before synchronizing. It confirms that the expected complete
+Cloud archive root is available and prevents synchronization from an incorrect, empty, or incomplete
+source directory.
+
+The marker is intentionally copied to the encrypted hard disk with the rest of the archive tree.
 
 ---
 
@@ -124,7 +139,7 @@ See [`EXTERNAL-DATA-SOURCES.md`](./EXTERNAL-DATA-SOURCES.md) for source-specific
 ## 2. Prepare machine recovery data
 
 ```bash
-MACHINE_WORK_DIR="$(mktemp -d /tmp/manual-backup-machine.XXXXXX)"
+MACHINE_WORK_DIR="$(mktemp -d /tmp/personal-backup-machine.XXXXXX)"
 trap 'rm -rf "$MACHINE_WORK_DIR"' EXIT
 
 MACHINE_BACKUP_DIR="$MACHINE_WORK_DIR/Machine"
@@ -328,11 +343,218 @@ sync-luks-backup \
 
 Review the planned changes before confirming the synchronization.
 
-The hard disk mirrors only `Cloud/Archives`. It does not provide versioning for those archives.
+The hard disk mirrors only `Cloud/Archives`. Replaced and deleted files are temporarily retained under `Trash`, but this is a review mechanism rather than a structured versioning or snapshot system.
 
 ---
 
-## 10. Restore
+# Backup Maintenance
+
+The following operations maintain and verify existing backups. They are not required to create a new
+encrypted backup, but they should be performed regularly to detect corruption, review retained files,
+and monitor the health of the archive hard disk.
+
+## 10. Mount the archive hard disk for maintenance
+
+After `sync-luks-backup` has completed and closed the disk, mount it for inspection and integrity scans:
+
+```bash
+mount-luks-backup \
+  --luks-uuid "$HARD_DRIVE_LUKS_UUID" \
+  --mapper "$HARD_DRIVE_MAPPER" \
+  --mount-point "$HARD_DRIVE_SCAN_ROOT"
+```
+
+Do not mount the same LUKS volume simultaneously through Files, UDisks, or another mapper.
+
+## 11. Run incremental integrity checks
+
+Persistent reports make these scans incremental. Files whose path, exact size, and modification time
+are unchanged are skipped automatically.
+
+```bash
+scan-jpeg-integrity \
+  --report "$INTEGRITY_REPORT_DIR/jpeg-current.jsonl" \
+  --target "$HARD_DRIVE_SCAN_ROOT"
+
+scan-mp4-integrity \
+  --report "$INTEGRITY_REPORT_DIR/mp4-current.jsonl" \
+  --target "$HARD_DRIVE_SCAN_ROOT"
+
+scan-nef-integrity \
+  --report "$INTEGRITY_REPORT_DIR/nef-current.jsonl" \
+  --target "$HARD_DRIVE_SCAN_ROOT"
+
+scan-age-tar-integrity \
+  --report "$INTEGRITY_REPORT_DIR/age-tar-current.jsonl" \
+  --target "$HARD_DRIVE_SCAN_ROOT"
+```
+
+Run these incremental checks after each archive synchronization.
+
+## 12. Review retained Trash files
+
+`sync-luks-backup` retains replaced or deleted files under:
+
+```text
+Trash/<timestamp>/
+```
+
+Create a reusable verification plan:
+
+```bash
+tidy-trash plan \
+  --trash-root "$HARD_DRIVE_SCAN_ROOT/Trash" \
+  --archives "$HARD_DRIVE_SCAN_ROOT/$CLOUD_NAME/Archives" \
+  --plan "$HOME/tmp/tidy-trash-plan-$(date +%Y%m%d-%H%M%S).json"
+```
+
+`tidy-trash` verifies potential duplicates using:
+
+1. the same filename;
+2. the same exact byte size;
+3. the same full BLAKE2b-256 checksum.
+
+Verified duplicates are moved into:
+
+```text
+Trash/Safe-to-delete/<timestamp>/
+```
+
+They are not deleted automatically.
+
+## 13. Unmount the archive hard disk
+
+Before unmounting, leave every shell and tmux pane whose current directory is on the disk:
+
+```bash
+cd ~
+```
+
+Then run:
+
+```bash
+unmount-luks-backup \
+  --mapper "$HARD_DRIVE_MAPPER" \
+  --mount-point "$HARD_DRIVE_SCAN_ROOT"
+```
+
+If the disk is still in use, the command reports the processes holding it.
+
+## 14. Annual full integrity verification
+
+Once a year, create fresh reports instead of reusing the incremental reports:
+
+```bash
+FULL_SCAN_ID="$(date +%Y-%m)"
+
+scan-jpeg-integrity \
+  --report "$INTEGRITY_REPORT_DIR/jpeg-full-$FULL_SCAN_ID.jsonl" \
+  --target "$HARD_DRIVE_SCAN_ROOT"
+
+scan-mp4-integrity \
+  --report "$INTEGRITY_REPORT_DIR/mp4-full-$FULL_SCAN_ID.jsonl" \
+  --target "$HARD_DRIVE_SCAN_ROOT"
+
+scan-nef-integrity \
+  --report "$INTEGRITY_REPORT_DIR/nef-full-$FULL_SCAN_ID.jsonl" \
+  --target "$HARD_DRIVE_SCAN_ROOT"
+
+scan-age-tar-integrity \
+  --report "$INTEGRITY_REPORT_DIR/age-tar-full-$FULL_SCAN_ID.jsonl" \
+  --target "$HARD_DRIVE_SCAN_ROOT"
+```
+
+A new report forces every applicable file to be checked again.
+
+## 15. Check hard-disk health
+
+Identify the physical disk carefully:
+
+```bash
+lsblk -o NAME,SIZE,MODEL,SERIAL,FSTYPE,MOUNTPOINTS
+```
+
+Read current SMART data:
+
+```bash
+sudo smartctl -a /dev/sdX
+```
+
+Start a long SMART self-test:
+
+```bash
+sudo smartctl -t long /dev/sdX
+```
+
+After the duration reported by `smartctl`:
+
+```bash
+sudo smartctl -a /dev/sdX
+```
+
+Never copy `/dev/sda` blindly from documentation. The device name can change between connections.
+
+## 16. Recommended routine
+
+```text
+After each Cloud archive update:
+  synchronize the HDD mirror
+  run incremental integrity scans
+
+Once a year:
+  run a SMART long self-test
+  run fresh full integrity scans
+
+After an incident:
+  inspect kernel logs and SMART
+  run a fresh full scan when appropriate
+```
+
+The maintenance checks do not all have the same cost:
+
+```text
+SMART information read:
+  every 3–6 months
+  very light
+
+SMART long test:
+  once a year
+  full disk surface test
+
+Full file integrity scans:
+  once a year
+  potentially 24 hours or more
+```
+
+## 17. In case of incident
+
+After an unsafe disconnection, I/O error, fall, filesystem repair, or unusual noise:
+
+```bash
+sudo dmesg -T |
+  grep -Ei 'I/O error|buffer error|ext4|sd[a-z]|usb|reset|disconnect' |
+  tail -200
+```
+
+Then:
+
+1. identify the physical HDD;
+2. inspect SMART;
+3. copy endangered data elsewhere before attempting repairs;
+4. mount the filesystem only if the system recognizes it normally;
+5. run a fresh full integrity scan when appropriate.
+
+Run `fsck` only on an unmounted filesystem and only after identifying the correct decrypted mapper.
+
+## 18. Restore
+
+Verify the encrypted archive against its recorded checksum:
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
+
+Continue only if the checksum verification succeeds.
 
 Inspect an encrypted archive:
 

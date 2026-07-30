@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""
+scan-age-tar-integrity
+
+Recursively verify encrypted .tar.age archives against the SHA256SUMS.txt file
+stored beside each archive by create-encrypted-backup.
+
+SHA256SUMS.txt is the only supported checksum filename. Older or manually
+created checksum files using another name must be renamed or regenerated
+manually.
+
+The scan is resumable. Results are written immediately to an append-only JSONL
+report. Running the same command again skips archives whose size, modification
+time, and checksum-file metadata have not changed.
+
+Possible statuses:
+
+  VALID
+      SHA-256 matches the archive entry in SHA256SUMS.txt.
+
+  INVALID
+      SHA-256 does not match.
+
+  MISSING_SUM_FILE
+      No SHA256SUMS.txt exists beside the archive.
+
+  MISSING_SUM_ENTRY
+      SHA256SUMS.txt exists but has no entry for this archive.
+
+  INVALID_SUM_FILE
+      SHA256SUMS.txt exists but its matching entry is malformed or unreadable.
+
+The script never modifies archives or checksum files.
+
+Usage:
+  scan-age-tar-integrity \
+    --report "$HOME/tmp/age-tar-integrity-backup.jsonl" \
+    --target "/media/clem/BACKUP"
+
+Resume:
+  Run the exact same command again.
+
+Read only known problems:
+  scan-age-tar-integrity \
+    --report "$HOME/tmp/age-tar-integrity-backup.jsonl" \
+    --target "/media/clem/BACKUP" \
+    --problems-only
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterator
+
+REPORT_VERSION = 1
+ARCHIVE_SUFFIX = ".tar.age"
+CHECKSUM_FILENAME = "SHA256SUMS.txt"
+HASH_CHUNK_SIZE = 8 * 1024 * 1024
+SHA256_LINE_RE = re.compile(r"^\\?([0-9a-fA-F]{64}) ([ *])(.*)$")
+SYSTEM_TRASH_NAMES = {
+    ".Trashes",
+    ".rsync-partial",
+}
+
+
+def should_skip_directory(path: Path, root: Path) -> bool:
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return True
+
+    for part in parts:
+        if part.startswith(".Trash-"):
+            return True
+
+        if part in SYSTEM_TRASH_NAMES:
+            return True
+
+    for index in range(len(parts) - 1):
+        if parts[index] == "Trash" and parts[index + 1] == "Safe-to-delete":
+            return True
+
+    return False
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="scan-age-tar-integrity",
+        usage=argparse.SUPPRESS,
+        description=(
+            "Recursively verify .tar.age archives against the SHA256SUMS.txt "
+            "file stored beside each archive.\n\n"
+            "Progress is stored in an append-only JSONL report, so an "
+            "interrupted scan resumes automatically when the same command is "
+            "run again.\n\n"
+            "The script never modifies archives or checksum files."
+        ),
+        epilog=(
+            "Start or resume the scan of the backup HDD:\n"
+            "  scan-age-tar-integrity \\\n"
+            '    --report "$HOME/tmp/age-tar-integrity-backup.jsonl" \\\n'
+            '    --target "/media/clem/BACKUP"\n\n'
+            "Display only known problems:\n"
+            "  scan-age-tar-integrity \\\n"
+            '    --report "$HOME/tmp/age-tar-integrity-backup.jsonl" \\\n'
+            '    --target "/media/clem/BACKUP" \\\n'
+            "    --problems-only\n\n"
+            "To resume an interrupted scan, run the first command again."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--report",
+        required=True,
+        type=Path,
+        help="Append-only JSONL report used to save progress and resume.",
+    )
+    parser.add_argument(
+        "--target",
+        required=True,
+        type=Path,
+        help="Directory to scan recursively.",
+    )
+    parser.add_argument(
+        "--problems-only",
+        action="store_true",
+        help="Display known invalid or missing-checksum cases without scanning.",
+    )
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        raise SystemExit(2)
+
+    return parser.parse_args()
+
+
+def iter_archives(root: Path) -> Iterator[Path]:
+    """Yield regular .tar.age files recursively without following symlinks."""
+    stack = [root]
+
+    while stack:
+        directory = stack.pop()
+
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+
+                    if entry.is_symlink():
+                        continue
+
+                    if entry.is_dir(follow_symlinks=False):
+                        if should_skip_directory(path, root):
+                            continue
+
+                        stack.append(path)
+                    elif (
+                        entry.is_file(follow_symlinks=False)
+                        and path.name.lower().endswith(ARCHIVE_SUFFIX)
+                    ):
+                        yield path
+        except OSError as exc:
+            fail(f"cannot read directory {directory}: {exc}")
+
+
+def append_record(handle, record: dict[str, Any]) -> None:
+    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def load_report(
+    report_path: Path,
+) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]]]:
+    header: dict[str, Any] | None = None
+    latest: dict[str, dict[str, Any]] = {}
+
+    if not report_path.exists():
+        return header, latest
+
+    try:
+        with report_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    print(
+                        f"Warning: ignoring incomplete report line {line_number}.",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                if not isinstance(record, dict):
+                    continue
+
+                if record.get("type") == "header" and header is None:
+                    header = record
+                elif record.get("type") == "file":
+                    relative_path = record.get("path")
+                    if isinstance(relative_path, str):
+                        latest[relative_path] = record
+    except OSError as exc:
+        fail(f"cannot read report {report_path}: {exc}")
+
+    return header, latest
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(HASH_CHUNK_SIZE):
+                digest.update(chunk)
+    except OSError as exc:
+        fail(f"cannot hash {path}: {exc}")
+
+    return digest.hexdigest()
+
+
+def is_regular_checksum_file(path: Path) -> bool:
+    return path.is_file() and not path.is_symlink()
+
+
+def checksum_metadata(checksum_path: Path) -> tuple[int | None, int | None]:
+    if not is_regular_checksum_file(checksum_path):
+        return None, None
+
+    try:
+        stat = checksum_path.stat(follow_symlinks=False)
+    except OSError:
+        return None, None
+
+    return stat.st_size, stat.st_mtime_ns
+
+
+def find_expected_checksum(
+    archive_path: Path,
+    checksum_path: Path,
+) -> tuple[str | None, str]:
+    if not is_regular_checksum_file(checksum_path):
+        return None, "MISSING_SUM_FILE"
+
+    archive_name = archive_path.name
+    malformed_match = False
+
+    try:
+        with checksum_path.open(
+            "r",
+            encoding="utf-8",
+            errors="surrogateescape",
+        ) as handle:
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                match = SHA256_LINE_RE.match(line)
+
+                if match is None:
+                    if line.endswith(archive_name):
+                        malformed_match = True
+                    continue
+
+                checksum, _marker, filename = match.groups()
+                filename = filename.removeprefix("./")
+
+                if filename == archive_name:
+                    return checksum.lower(), "FOUND"
+    except OSError:
+        return None, "INVALID_SUM_FILE"
+
+    if malformed_match:
+        return None, "INVALID_SUM_FILE"
+
+    return None, "MISSING_SUM_ENTRY"
+
+
+def check_archive(
+    archive_path: Path,
+) -> tuple[str, bool, str, str | None, str | None]:
+    checksum_path = archive_path.parent / CHECKSUM_FILENAME
+    expected, status = find_expected_checksum(archive_path, checksum_path)
+
+    if status == "MISSING_SUM_FILE":
+        return status, True, f"No {CHECKSUM_FILENAME} beside archive.", None, None
+
+    if status == "MISSING_SUM_ENTRY":
+        return (
+            status,
+            True,
+            f"{CHECKSUM_FILENAME} has no entry for {archive_path.name}.",
+            None,
+            None,
+        )
+
+    if status == "INVALID_SUM_FILE":
+        return (
+            status,
+            True,
+            f"{CHECKSUM_FILENAME} has an invalid or unreadable matching entry.",
+            None,
+            None,
+        )
+
+    if expected is None:
+        return (
+            "INVALID_SUM_FILE",
+            True,
+            "Unable to determine expected SHA-256.",
+            None,
+            None,
+        )
+
+    actual = sha256_file(archive_path)
+
+    if actual == expected:
+        return "VALID", False, "SHA-256 matches.", expected, actual
+
+    return "INVALID", True, "SHA-256 mismatch.", expected, actual
+
+
+def record_is_current(
+    target: Path,
+    record: dict[str, Any],
+) -> bool:
+    relative_path = record.get("path")
+
+    if not isinstance(relative_path, str):
+        return False
+
+    archive_path = target / relative_path
+
+    try:
+        if archive_path.is_symlink():
+            return False
+
+        resolved = archive_path.resolve(strict=True)
+        resolved.relative_to(target)
+        archive_stat = resolved.stat(follow_symlinks=False)
+    except (OSError, ValueError):
+        return False
+
+    if should_skip_directory(resolved.parent, target):
+        return False
+
+    checksum_path = resolved.parent / CHECKSUM_FILENAME
+    checksum_size, checksum_mtime_ns = checksum_metadata(checksum_path)
+
+    return (
+        archive_stat.st_size == record.get("size")
+        and archive_stat.st_mtime_ns == record.get("mtime_ns")
+        and checksum_size == record.get("checksum_size")
+        and checksum_mtime_ns == record.get("checksum_mtime_ns")
+    )
+
+
+def print_known_problems(
+    target: Path,
+    records: dict[str, dict[str, Any]],
+) -> int:
+    problems = [
+        record
+        for record in records.values()
+        if record.get("problem") is True
+        and record_is_current(target, record)
+    ]
+
+    for record in sorted(problems, key=lambda item: str(item.get("path", ""))):
+        path = target / str(record.get("path", ""))
+        status = str(record.get("status", "UNKNOWN"))
+        message = str(record.get("message", "")).strip()
+
+        print(f"{status}: {path}")
+        if message:
+            print(f"  {message}")
+
+        expected = record.get("expected_sha256")
+        actual = record.get("actual_sha256")
+
+        if isinstance(expected, str):
+            print(f"  Expected: {expected}")
+        if isinstance(actual, str):
+            print(f"  Actual:   {actual}")
+
+    print()
+    print(f"Known problematic .tar.age archives: {len(problems)}")
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+
+    try:
+        target = args.target.expanduser().resolve(strict=True)
+    except OSError as exc:
+        fail(f"cannot resolve target: {exc}")
+
+    if not target.is_dir():
+        fail(f"target is not a directory: {target}")
+    if target == Path("/"):
+        fail("refusing to scan /")
+
+    report_path = args.report.expanduser().resolve(strict=False)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    header, records = load_report(report_path)
+
+    if header is not None:
+        if header.get("version") != REPORT_VERSION:
+            fail(f"unsupported report version: {header.get('version')!r}")
+
+        if header.get("target") != str(target):
+            fail(
+                "report belongs to another target:\n"
+                f"  Report target: {header.get('target')}\n"
+                f"  Requested:     {target}"
+            )
+
+        expected_checker = "SHA-256 from adjacent SHA256SUMS.txt"
+        if header.get("checker") != expected_checker:
+            fail("report was created by another checker")
+
+    if args.problems_only:
+        return print_known_problems(target, records)
+
+    mode = "a" if report_path.exists() else "x"
+
+    print("Indexing .tar.age paths...")
+    archives = list(iter_archives(target))
+    total_files = len(archives)
+
+    checked_now = 0
+    skipped = 0
+    problems_now = 0
+    known_problems = sum(
+        1
+        for record in records.values()
+        if record.get("problem") is True
+        and record_is_current(target, record)
+    )
+
+    try:
+        with report_path.open(mode, encoding="utf-8") as report:
+            if header is None:
+                append_record(
+                    report,
+                    {
+                        "type": "header",
+                        "version": REPORT_VERSION,
+                        "created_at": now_iso(),
+                        "target": str(target),
+                        "checker": "SHA-256 from adjacent SHA256SUMS.txt",
+                        "checksum_filename": CHECKSUM_FILENAME,
+                    },
+                )
+
+            print(f"Target : {target}")
+            print(f"Report : {report_path}")
+            print("Scanning .tar.age archives. Press Ctrl+C to stop safely.")
+            print()
+
+            for archive_path in archives:
+                try:
+                    stat = archive_path.stat(follow_symlinks=False)
+                    relative_path = str(archive_path.relative_to(target))
+                except OSError as exc:
+                    print(
+                        f"\nWarning: cannot stat {archive_path}: {exc}",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                checksum_path = archive_path.parent / CHECKSUM_FILENAME
+                checksum_size, checksum_mtime_ns = checksum_metadata(checksum_path)
+
+                previous = records.get(relative_path)
+
+                previous_problem = (
+                    previous is not None
+                    and previous.get("problem") is True
+                    and record_is_current(target, previous)
+                )
+
+                if (
+                    previous is not None
+                    and previous.get("size") == stat.st_size
+                    and previous.get("mtime_ns") == stat.st_mtime_ns
+                    and previous.get("checksum_size") == checksum_size
+                    and previous.get("checksum_mtime_ns") == checksum_mtime_ns
+                ):
+                    skipped += 1
+                    processed = checked_now + skipped
+                    print(
+                        f"\rChecked {processed}/{total_files} | "
+                        f"Problems {known_problems} | "
+                        f"New {checked_now} | Resumed {skipped} | "
+                        f"{relative_path}",
+                        end="",
+                        flush=True,
+                    )
+                    continue
+
+                checked_now += 1
+                processed = checked_now + skipped
+                print(
+                    f"\rChecked {processed}/{total_files} | "
+                    f"Problems {known_problems} | "
+                    f"New {checked_now} | Resumed {skipped} | "
+                    f"{relative_path}",
+                    end="",
+                    flush=True,
+                )
+
+                status, problem, message, expected, actual = check_archive(
+                    archive_path
+                )
+
+                record = {
+                    "type": "file",
+                    "checked_at": now_iso(),
+                    "path": relative_path,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "checksum_file": (
+                        str(checksum_path.relative_to(target))
+                        if is_regular_checksum_file(checksum_path)
+                        else None
+                    ),
+                    "checksum_size": checksum_size,
+                    "checksum_mtime_ns": checksum_mtime_ns,
+                    "status": status,
+                    "problem": problem,
+                    "message": message,
+                    "expected_sha256": expected,
+                    "actual_sha256": actual,
+                }
+
+                append_record(report, record)
+                records[relative_path] = record
+
+                if previous_problem and not problem:
+                    known_problems -= 1
+                elif not previous_problem and problem:
+                    known_problems += 1
+
+                if problem:
+                    problems_now += 1
+                    print("\r" + " " * 180 + "\r", end="")
+                    print(f"{status}: {archive_path}")
+                    print(f"  {message}")
+                    if expected is not None:
+                        print(f"  Expected: {expected}")
+                    if actual is not None:
+                        print(f"  Actual:   {actual}")
+
+    except KeyboardInterrupt:
+        print("\r" + " " * 180 + "\r", end="")
+        print("Scan interrupted safely.")
+        print(f"Resume with the same command. Report: {report_path}")
+        return 130
+
+    print("\r" + " " * 180 + "\r", end="")
+
+    def count_status(name: str) -> int:
+        return sum(
+            1
+            for record in records.values()
+            if record.get("status") == name
+            and record_is_current(target, record)
+        )
+
+    print("Scan completed.")
+    print(f"  Total .tar.age files : {total_files}")
+    print(f"  Checked now          : {checked_now}")
+    print(f"  Skipped from report  : {skipped}")
+    print(f"  Valid                : {count_status('VALID')}")
+    print(f"  Invalid checksum     : {count_status('INVALID')}")
+    print(f"  Missing sum file     : {count_status('MISSING_SUM_FILE')}")
+    print(f"  Missing sum entry    : {count_status('MISSING_SUM_ENTRY')}")
+    print(f"  Invalid sum file     : {count_status('INVALID_SUM_FILE')}")
+    print(f"  Problems found now   : {problems_now}")
+    print(f"  Known problems       : {known_problems}")
+    print(f"  Report               : {report_path}")
+    print()
+    print("Display known problems with:")
+    print(
+        f'  scan-age-tar-integrity --report "{report_path}" '
+        f'--target "{target}" --problems-only'
+    )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

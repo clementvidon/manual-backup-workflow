@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  mount-luks-backup \
+    --luks-uuid <uuid> \
+    [--mapper <name>] \
+    [--mount-point <directory>]
+USAGE
+}
+
+LUKS_UUID=""
+MAPPER="backup"
+MOUNT_POINT="/media/$USER/BACKUP"
+OPENED_BY_SCRIPT=false
+MOUNTED_BY_SCRIPT=false
+
+while (($#)); do
+  case "$1" in
+    --luks-uuid)
+      LUKS_UUID="${2:?Missing value for --luks-uuid}"
+      shift 2
+      ;;
+    --mapper)
+      MAPPER="${2:?Missing value for --mapper}"
+      shift 2
+      ;;
+    --mount-point)
+      MOUNT_POINT="${2:?Missing value for --mount-point}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+[[ -n "$LUKS_UUID" ]] || {
+  usage >&2
+  exit 2
+}
+
+for command in \
+  cryptsetup \
+  findmnt \
+  lsblk \
+  mkdir \
+  mount \
+  mountpoint \
+  realpath \
+  sudo \
+  umount; do
+  command -v "$command" >/dev/null 2>&1 || {
+    echo "Required command not found: $command" >&2
+    exit 1
+  }
+done
+
+[[ "$MAPPER" =~ ^[A-Za-z0-9._+-]+$ ]] || {
+  echo "Invalid mapper name: $MAPPER" >&2
+  exit 2
+}
+
+[[ "$MOUNT_POINT" == /* && "$MOUNT_POINT" != "/" ]] || {
+  echo "Mount point must be an absolute path other than /." >&2
+  exit 2
+}
+
+MOUNT_POINT="${MOUNT_POINT%/}"
+LUKS_DEVICE="/dev/disk/by-uuid/$LUKS_UUID"
+
+[[ -e "$LUKS_DEVICE" ]] || {
+  echo "LUKS device not found: $LUKS_DEVICE" >&2
+  exit 1
+}
+
+LUKS_DEVICE="$(realpath "$LUKS_DEVICE")"
+
+[[ "$(lsblk -dnro FSTYPE "$LUKS_DEVICE")" == "crypto_LUKS" ]] || {
+  echo "Device is not a LUKS container: $LUKS_DEVICE" >&2
+  exit 1
+}
+
+cleanup_failure() {
+  local status=$?
+  local cleanup_failed=false
+
+  trap - EXIT HUP INT TERM
+
+  if ((status != 0)); then
+    if $MOUNTED_BY_SCRIPT && mountpoint -q "$MOUNT_POINT"; then
+      if sudo umount "$MOUNT_POINT"; then
+        MOUNTED_BY_SCRIPT=false
+      else
+        echo "Warning: unable to unmount $MOUNT_POINT." >&2
+        echo "The mapper has been left open." >&2
+        cleanup_failed=true
+      fi
+    fi
+
+    if ! $MOUNTED_BY_SCRIPT &&
+       $OPENED_BY_SCRIPT &&
+       sudo cryptsetup status "$MAPPER" >/dev/null 2>&1; then
+      if sudo cryptsetup close "$MAPPER"; then
+        OPENED_BY_SCRIPT=false
+      else
+        echo "Warning: unable to close mapper $MAPPER." >&2
+        cleanup_failed=true
+      fi
+    fi
+  fi
+
+  if $cleanup_failed; then
+    status=1
+  fi
+
+  exit "$status"
+}
+
+trap cleanup_failure EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [[ -e "/dev/mapper/$MAPPER" ]]; then
+  echo "Mapper already exists: /dev/mapper/$MAPPER" >&2
+  echo "The disk may already be open." >&2
+  echo "Inspect existing mappings with:" >&2
+  echo "  sudo dmsetup ls --tree" >&2
+  exit 1
+fi
+
+if mountpoint -q "$MOUNT_POINT"; then
+  echo "Mount point is already in use: $MOUNT_POINT" >&2
+  exit 1
+fi
+
+echo "Opening $LUKS_DEVICE as $MAPPER..."
+sudo cryptsetup open "$LUKS_DEVICE" "$MAPPER"
+OPENED_BY_SCRIPT=true
+
+MAPPED_DEVICE="/dev/mapper/$MAPPER"
+
+[[ -b "$MAPPED_DEVICE" ]] || {
+  echo "Mapped device unavailable: $MAPPED_DEVICE" >&2
+  exit 1
+}
+
+sudo mkdir -p "$MOUNT_POINT"
+
+echo "Mounting $MAPPED_DEVICE at $MOUNT_POINT..."
+sudo mount "$MAPPED_DEVICE" "$MOUNT_POINT"
+MOUNTED_BY_SCRIPT=true
+
+MOUNTED_SOURCE="$(
+  realpath "$(findmnt -n -o SOURCE --target "$MOUNT_POINT")"
+)"
+EXPECTED_SOURCE="$(realpath "$MAPPED_DEVICE")"
+
+[[ "$MOUNTED_SOURCE" == "$EXPECTED_SOURCE" ]] || {
+  echo "Unexpected device mounted at $MOUNT_POINT." >&2
+  echo "Expected: $EXPECTED_SOURCE" >&2
+  echo "Found:    $MOUNTED_SOURCE" >&2
+
+  if sudo umount "$MOUNT_POINT"; then
+    MOUNTED_BY_SCRIPT=false
+  fi
+
+  exit 1
+}
+
+trap - EXIT HUP INT TERM
+OPENED_BY_SCRIPT=false
+MOUNTED_BY_SCRIPT=false
+
+echo
+echo "Backup HDD mounted successfully:"
+echo "  Device : $LUKS_DEVICE"
+echo "  Mapper : $MAPPED_DEVICE"
+echo "  Mount  : $MOUNT_POINT"
